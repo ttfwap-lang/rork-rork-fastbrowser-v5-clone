@@ -1,0 +1,13 @@
+{
+  "$schema": "https://rork.com/schema/rork.json",
+  "apps": [
+    {
+      "name": "Fast Fill Browser 0.2",
+      "path": "ios",
+      "framework": "swift",
+      "settings": {
+        "displayName": "Fast Browserv4"
+      }
+    }
+  ]
+}
