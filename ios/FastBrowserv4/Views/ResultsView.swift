@@ -81,9 +81,13 @@ struct ResultsView: View {
         ) {
             Button("Clear All", role: .destructive) {
                 AttemptTrackingService.shared.clearAll(context: modelContext)
+                // Re-enable every disabled credential too — the docs promise
+                // that Clear All is the way to reset blocked logins.
+                PermaDisabledStore.shared.clearAll()
+                TempDisabledStore.shared.clearAll()
             }
         } message: {
-            Text("Removes every attempt record and screenshot. The vault and passwords are not affected.")
+            Text("Removes every attempt record and screenshot, and re-enables all disabled credentials. The vault and passwords are not affected.")
         }
         .sheet(item: $selectedRecord) { record in
             NavigationStack { ResultDetailView(record: record) }

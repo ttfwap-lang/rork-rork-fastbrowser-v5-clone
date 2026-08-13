@@ -601,24 +601,6 @@ struct JavaScriptInjectionService {
 
     // MARK: - Fingerprint hardening
 
-    /// Deletes known Google tracking cookies. Called by the native timer
-    /// every hour from each active web view.
-    static func deleteTrackingCookiesScript() -> String {
-        return """
-        (function() {
-            var cookies = ['__Secure-3PSID', '__Secure-3PAPISID', '__Secure-3PSIDCC',
-                           '_ga', '_gid', '_gat', 'NID', 'SID', 'HSID', 'APISID',
-                           'SAPISID', 'SSID', 'SIDCC', '__Secure-1PSID', '__Secure-1PAPISID'];
-            for (var i = 0; i < cookies.length; i++) {
-                document.cookie = cookies[i] + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=' + location.hostname;
-                document.cookie = cookies[i] + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.' + location.hostname;
-                document.cookie = cookies[i] + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
-            }
-            return JSON.stringify({ deleted: true });
-        })();
-        """
-    }
-
     /// Spoils font enumeration so sites can't fingerprint by installed fonts.
     /// Injected at document start so it takes effect before any page JS.
     static func fontSpoofingScript() -> String {
@@ -684,7 +666,9 @@ struct JavaScriptInjectionService {
 
     /// Simulates human-like scrolling using randomised sine/cosine patterns.
     /// WKWebView doesn't expose mouse events, but scroll events are a common
-    /// fingerprinting vector — this normalises them.
+    /// fingerprinting vector — this normalises them. Gated behind the
+    /// `__ffb_rcrActive` flag so pages only scroll during automated RCR
+    /// runs, never during ordinary browsing.
     static func humanScrollSimulationScript() -> String {
         return """
         (function() {
@@ -693,6 +677,7 @@ struct JavaScriptInjectionService {
             var phase = Math.random() * Math.PI * 2;
             var interval = 2000 + Math.random() * 4000;
             setInterval(function() {
+                if (window.__ffb_rcrActive !== true) return;
                 phase += 0.3 + Math.random() * 0.7;
                 var dy = Math.round(Math.sin(phase) * 30 + Math.cos(phase * 1.7) * 20 + Math.sin(phase * 3.1) * 15);
                 var dx = Math.round(Math.cos(phase * 2.3) * 12 + Math.sin(phase * 0.7) * 8);
@@ -702,6 +687,16 @@ struct JavaScriptInjectionService {
             }, interval);
         })();
         """
+    }
+
+    /// Enables human-like scrolling — called when an RCR run starts.
+    static func rcrScrollEnableScript() -> String {
+        "window.__ffb_rcrActive = true;"
+    }
+
+    /// Disables human-like scrolling — called when an RCR run stops.
+    static func rcrScrollDisableScript() -> String {
+        "window.__ffb_rcrActive = false;"
     }
 
     static func extractFilledCredentialsScript() -> String {

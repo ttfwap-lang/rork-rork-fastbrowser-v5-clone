@@ -28,7 +28,16 @@ class VaultViewModel {
     var isShowingPasswordGenerator: Bool = false
     var isShowingExcludedDomains: Bool = false
     var selectedCredential: Credential?
-    var sortOption: VaultSortOption = .recentlyUsed
+    /// Display order for the vault list. Persisted so the choice survives
+    /// relaunches; RCR runs keep their own fixed queue order regardless.
+    var sortOption: VaultSortOption = VaultSortOption(
+        rawValue: UserDefaults.standard.string(forKey: "vaultSortOption") ?? ""
+    ) ?? .domain {
+        didSet {
+            guard sortOption != oldValue else { return }
+            UserDefaults.standard.set(sortOption.rawValue, forKey: "vaultSortOption")
+        }
+    }
 
     /// IDs of credentials selected while in multi-select (edit) mode.
     var selectedIDs: Set<String> = []
@@ -122,22 +131,6 @@ class VaultViewModel {
         }
         context.insert(ExcludedDomain(domain: canonical))
         return true
-    }
-
-    func importCredentials(_ imported: [ImportedCredential], context: ModelContext) -> Int {
-        var count = 0
-        for item in imported {
-            let credential = Credential(
-                domain: item.domain,
-                username: item.username,
-                notes: item.notes
-            )
-            context.insert(credential)
-            if KeychainService.shared.savePasswords(item.passwords, for: credential.id) {
-                count += 1
-            }
-        }
-        return count
     }
 
     /// Sort a flat list of credentials according to the current sort option.

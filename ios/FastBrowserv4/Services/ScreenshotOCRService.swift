@@ -48,7 +48,14 @@ enum ScreenshotOCRService {
             request.automaticallyDetectsLanguage = true
 
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            try? handler.perform([request])
+            // If the request throws instead of invoking its completion
+            // handler, the continuation must still resume — otherwise the
+            // caller hangs forever.
+            do {
+                try handler.perform([request])
+            } catch {
+                continuation.resume(returning: "")
+            }
         }
     }
 

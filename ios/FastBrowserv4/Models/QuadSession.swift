@@ -20,8 +20,6 @@ final class QuadSession: Identifiable {
     let id: String
     let index: Int
     let storeID: UUID
-    /// Fixed legacy pair side used by the dual RCR lane engine.
-    let pairIndex: Int
     /// Browser target assignment. Recalculated from the active layout and
     /// split pattern whenever the grid or dual-site pattern changes.
     var targetSiteIndex: Int
@@ -69,7 +67,6 @@ final class QuadSession: Identifiable {
         self.index = index
         self.id = "S\(index + 1)"
         self.storeID = QuadDataStore.identifier(for: index)
-        self.pairIndex = index % 2
         self.targetSiteIndex = index % 2
     }
 

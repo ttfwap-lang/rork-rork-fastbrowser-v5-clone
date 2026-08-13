@@ -77,7 +77,9 @@ nonisolated struct ComboListPreview: Sendable {
     var isEmpty: Bool { credentialCount == 0 }
 }
 
-struct CredentialImportService {
+/// Pure text parsers for importing credentials — no state, so safe to run
+/// off the main thread for large files.
+nonisolated struct CredentialImportService {
     static func parseCSV(_ content: String, format: ImportFormat) -> [ImportedCredential] {
         if format == .multiPasswordCSV {
             return parseMultiPasswordCSV(content)
@@ -188,6 +190,18 @@ struct CredentialImportService {
 
     static func extractDomain(from urlString: String) -> String {
         return ExcludedDomain.canonicalize(urlString)
+    }
+
+    /// Merges two password lists into one, preserving order and dropping
+    /// duplicates. Used when an import targets a credential that already
+    /// exists, so the new passwords are appended to the existing keychain
+    /// entry instead of splitting the vault row from its payload.
+    static func mergePasswords(existing: [String], new: [String]) -> [String] {
+        var merged = existing
+        for pass in new where !merged.contains(pass) {
+            merged.append(pass)
+        }
+        return merged
     }
 
     // MARK: - Combo List Parsing

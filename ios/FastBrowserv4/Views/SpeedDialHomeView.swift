@@ -123,11 +123,6 @@ private struct SpeedDialTile: View {
 
     @State private var tapTrigger = 0
 
-    private var faviconURL: URL? {
-        guard let host = entry.resolvedURL?.host(percentEncoded: false) else { return nil }
-        return URL(string: "https://www.google.com/s2/favicons?domain=\(host)&sz=128")
-    }
-
     var body: some View {
         Button {
             tapTrigger &+= 1
@@ -152,18 +147,7 @@ private struct SpeedDialTile: View {
         RoundedRectangle(cornerRadius: 18, style: .continuous)
             .fill(Color(.secondarySystemBackground))
             .frame(width: 64, height: 64)
-            .overlay {
-                AsyncImage(url: faviconURL) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .padding(15)
-                    } else {
-                        monogram
-                    }
-                }
-            }
+            .overlay { monogram }
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .strokeBorder(accent.opacity(0.25), lineWidth: 1)

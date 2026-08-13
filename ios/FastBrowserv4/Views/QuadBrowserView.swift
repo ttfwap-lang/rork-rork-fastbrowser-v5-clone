@@ -95,6 +95,11 @@ struct QuadCellWebView: UIViewRepresentable {
                     controller?.hostBrowser?.updateURLBar()
                 }
                 controller?.cellPageDidFinish(session: session)
+                // Page-load autofill for multi-window tiles (skips while any
+                // RCR run is active).
+                if !session.rcrRunning {
+                    controller?.handleQuadPageLoadAutofill(for: session)
+                }
             }
         }
 
@@ -110,6 +115,21 @@ struct QuadCellWebView: UIViewRepresentable {
                 session.isLoading = false
                 session.estimatedProgress = 1.0
             }
+        }
+
+        nonisolated func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction
+        ) async -> WKNavigationActionPolicy {
+            let navType = await MainActor.run { navigationAction.navigationType }
+            if navType == .formSubmitted {
+                await MainActor.run {
+                    if controller?.anyRCRRunning != true {
+                        controller?.detectAndOfferSaveQuad(session: session)
+                    }
+                }
+            }
+            return .allow
         }
 
         // KVO handler for WKWebView.estimatedProgress.

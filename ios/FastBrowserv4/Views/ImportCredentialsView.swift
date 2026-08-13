@@ -272,80 +272,118 @@ struct ImportCredentialsView: View {
     private func handleFileImport(_ result: Result<[URL], Error>) {
         guard case .success(let urls) = result, let url = urls.first else { return }
         isImporting = true
+        importResult = nil
 
         guard url.startAccessingSecurityScopedResource() else {
             importResult = "Could not access file"
             isImporting = false
             return
         }
-        defer { url.stopAccessingSecurityScopedResource() }
 
-        do {
-            let content = try String(contentsOf: url, encoding: .utf8)
-
-            let imported: [ImportedCredential]
-            if selectedFormat == .comboList {
-                let sep = CredentialImportService.detectSeparator(in: content)
-                imported = CredentialImportService.parseComboList(
-                    content,
-                    separator: sep,
-                    format: comboFormat
-                )
-            } else {
-                imported = CredentialImportService.parseCSV(content, format: selectedFormat)
+        // Read and parse off the main thread — large imports otherwise
+        // freeze the UI for the whole parse.
+        let format = selectedFormat
+        let combo = comboFormat
+        Task {
+            let parsed: Result<[ImportedCredential], Error> = await Task.detached {
+                do {
+                    let content = try String(contentsOf: url, encoding: .utf8)
+                    if format == .comboList {
+                        let sep = CredentialImportService.detectSeparator(in: content)
+                        return .success(
+                            CredentialImportService.parseComboList(
+                                content,
+                                separator: sep,
+                                format: combo
+                            )
+                        )
+                    }
+                    return .success(CredentialImportService.parseCSV(content, format: format))
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            url.stopAccessingSecurityScopedResource()
+            switch parsed {
+            case .success(let imported):
+                importResult = persistImported(imported)
+            case .failure(let error):
+                importResult = "Error reading file: \(error.localizedDescription)"
             }
-
-            let summary = persistImported(imported)
-            importResult = summary
-        } catch {
-            importResult = "Error reading file: \(error.localizedDescription)"
+            isImporting = false
         }
-
-        isImporting = false
     }
 
     private func performComboImport() {
         isImporting = true
-        let imported = CredentialImportService.parseComboList(
-            pasteText,
-            separator: comboSeparator,
-            format: comboFormat
-        )
-        let summary = persistImported(imported)
-        importResult = summary
-        if !imported.isEmpty {
-            pasteText = ""
+        let text = pasteText
+        let separator = comboSeparator
+        let format = comboFormat
+        Task {
+            let imported = await Task.detached {
+                CredentialImportService.parseComboList(
+                    text,
+                    separator: separator,
+                    format: format
+                )
+            }.value
+            let summary = persistImported(imported)
+            importResult = summary
+            if !imported.isEmpty {
+                pasteText = ""
+            }
+            isImporting = false
         }
-        isImporting = false
     }
 
     /// Inserts the parsed credentials into SwiftData + Keychain and returns a
-    /// human-readable summary string.
+    /// human-readable summary string. Re-importing a login that already
+    /// exists merges its passwords into the existing credential instead of
+    /// creating a duplicate row (which would split the vault entry from its
+    /// keychain payload).
     @discardableResult
     private func persistImported(_ imported: [ImportedCredential]) -> String {
         guard !imported.isEmpty else {
             return "No valid credentials found"
         }
 
-        var credentials: [(Credential, [String])] = []
-        for item in imported {
-            let credential = Credential(domain: item.domain, username: item.username, notes: item.notes)
-            modelContext.insert(credential)
-            credentials.append((credential, item.passwords))
-        }
-
-        try? modelContext.save()
-
-        var count = 0
+        var newCount = 0
+        var mergedCount = 0
         var passwordTotal = 0
-        for (credential, passwords) in credentials {
-            if KeychainService.shared.savePasswords(passwords, for: credential.id) {
-                count += 1
-                passwordTotal += passwords.count
+
+        for item in imported {
+            let domainLower = item.domain.lowercased()
+            let username = item.username
+            let descriptor = FetchDescriptor<Credential>(
+                predicate: #Predicate<Credential> {
+                    $0.domain == domainLower && $0.username == username
+                }
+            )
+            if let existing = try? modelContext.fetch(descriptor).first {
+                // Merge into the existing credential's keychain entry.
+                let current = KeychainService.shared.getPasswords(for: existing.id)
+                let merged = CredentialImportService.mergePasswords(
+                    existing: current,
+                    new: item.passwords
+                )
+                if KeychainService.shared.savePasswords(merged, for: existing.id) {
+                    mergedCount += 1
+                    passwordTotal += item.passwords.count
+                }
+            } else {
+                let credential = Credential(domain: item.domain, username: item.username, notes: item.notes)
+                modelContext.insert(credential)
+                if KeychainService.shared.savePasswords(item.passwords, for: credential.id) {
+                    newCount += 1
+                    passwordTotal += item.passwords.count
+                }
             }
         }
 
         try? modelContext.save()
-        return "Imported \(count) credentials (\(passwordTotal) passwords)"
+        if mergedCount > 0 {
+            return "Imported \(newCount) credentials, merged \(mergedCount) (\(passwordTotal) passwords)"
+        }
+        return "Imported \(newCount) credentials (\(passwordTotal) passwords)"
     }
 }

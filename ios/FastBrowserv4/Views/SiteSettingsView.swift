@@ -3,6 +3,7 @@ import SwiftData
 
 struct SiteSettingsView: View {
     let domain: String
+    let viewModel: BrowserViewModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
     @State private var setting: SiteSetting?
@@ -13,8 +14,6 @@ struct SiteSettingsView: View {
     @State private var isSureLogin: Bool = false
     @State private var retryCount: Int = 1
     @State private var retryDelay: Double = 1.0
-    @State private var isAutoRC: Bool = false
-    @State private var isAutoBurnOnRC: Bool = false
     @State private var isDetectResponse: Bool = false
 
     var body: some View {
@@ -74,20 +73,6 @@ struct SiteSettingsView: View {
             }
 
             Section {
-                Toggle("Auto Rotate Credential", isOn: $isAutoRC)
-
-                if isAutoRC {
-                    Toggle("Auto Burn on Rotate", isOn: $isAutoBurnOnRC)
-                }
-            } header: {
-                Text("Combo Modes")
-            } footer: {
-                if isAutoRC {
-                    Text("Auto RC rotates to the next credential if login appears to fail. Auto Burn clears session data before retrying.")
-                }
-            }
-
-            Section {
                 Toggle("Detect login response", isOn: $isDetectResponse)
             } header: {
                 Text("Detection")
@@ -122,8 +107,6 @@ struct SiteSettingsView: View {
             isSureLogin = existing.isSureLoginEnabled
             retryCount = existing.sureLoginRetryCount
             retryDelay = existing.sureLoginDelaySeconds
-            isAutoRC = existing.isAutoRCEnabled
-            isAutoBurnOnRC = existing.isAutoBurnOnRC
         }
         isDetectResponse = UserDefaults.standard.bool(
             forKey: BrowserViewModel.detectResponseKey(for: domain)
@@ -146,14 +129,16 @@ struct SiteSettingsView: View {
         target.isSureLoginEnabled = isSureLogin
         target.sureLoginRetryCount = retryCount
         target.sureLoginDelaySeconds = retryDelay
-        target.isAutoRCEnabled = isAutoRC
-        target.isAutoBurnOnRC = isAutoBurnOnRC
         target.updatedAt = Date()
 
         UserDefaults.standard.set(
             isDetectResponse,
             forKey: BrowserViewModel.detectResponseKey(for: domain)
         )
+
+        // Drop the cached copy so auto-fill and RCR pick up the new
+        // selectors immediately — no relaunch required.
+        viewModel.invalidateSiteSettingCache(for: domain)
 
         dismiss()
     }

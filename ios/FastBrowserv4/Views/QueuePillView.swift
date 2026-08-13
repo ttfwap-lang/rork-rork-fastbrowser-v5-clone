@@ -118,7 +118,7 @@ struct QueuePillView: View {
                 .font(.caption.weight(.heavy))
                 .foregroundStyle(titleColor)
                 .kerning(0.5)
-            Text("\(min(completedCount + (upcoming.first?.isCurrent == true ? 1 : 0), total)) / \(total)")
+            Text("\(min(completedCount, total)) / \(total)")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
             Spacer()

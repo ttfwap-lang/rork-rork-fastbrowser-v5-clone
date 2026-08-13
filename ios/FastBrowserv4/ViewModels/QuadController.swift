@@ -26,7 +26,6 @@ final class QuadController {
     var anyRCRRunning: Bool {
         enabledSessions.contains { $0.rcrRunning }
     }
-    var lastCompletedAt: Date?
     /// When `true`, sessions retry passwords that previously came back as
     /// `failed`. `success` and `disabled` results are always skipped.
     var retryFailed: Bool = false
@@ -66,7 +65,6 @@ final class QuadController {
     func setGridSize(_ newSize: WindowGridSize) {
         guard newSize != gridSize else { return }
         gridSize = newSize
-        if focusedIndex >= activeCount { focusedIndex = 0 }
 
         // Clear any disabled state from a previous dual-site 3×3 layout.
         for s in activeSessions { s.isDisabled = false }
@@ -79,6 +77,16 @@ final class QuadController {
         } else if !newSize.supportsDualSite {
             isDualTargetMode = false
             for session in activeSessions { session.targetSiteIndex = 0 }
+        }
+        refocusIfDisabled()
+    }
+
+    /// Moves focus off any disabled (unused) cell so the shared toolbar can
+    /// never point at an inert window — e.g. the 3×3 center in dual-site
+    /// mode after the user last tapped it.
+    func refocusIfDisabled() {
+        if focusedIndex >= activeCount || sessions[focusedIndex].isDisabled {
+            focusedIndex = enabledSessions.first?.index ?? 0
         }
     }
 
@@ -142,10 +150,134 @@ final class QuadController {
             navigate(session, to: target == 0 ? urlA : urlB)
         }
         rebuildLaneMapping()
+        refocusIfDisabled()
     }
 
     func representativeSession(forTargetSite targetSiteIndex: Int) -> QuadSession? {
         activeSessions.first { $0.targetSiteIndex == targetSiteIndex && !$0.isDisabled }
+    }
+
+    // MARK: - Page-load autofill & save-offer (multi-window)
+
+    /// Fills a matching vault credential into one multi-window cell when
+    /// Settings → Auto-fill on Page Load is enabled. Mirrors the
+    /// single-window flow, keyed to this session's own domain.
+    func handleQuadPageLoadAutofill(for session: QuadSession) {
+        guard !anyRCRRunning, !session.rcrRunning else { return }
+        guard browserViewModel?.isRCRRunning != true else { return }
+        let autoFillEnabled = UserDefaults.standard.object(forKey: "autoFillOnPageLoad") as? Bool ?? true
+        guard autoFillEnabled else { return }
+
+        let domain = session.domain
+        guard !domain.isEmpty, browserViewModel?.isDomainExcluded(domain) == false else { return }
+        guard let webView = session.webView else { return }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Brief settle so SPA login forms finish mounting.
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !self.anyRCRRunning, !session.rcrRunning else { return }
+
+            let detectRaw = try? await webView.evaluateJavaScript(
+                JavaScriptInjectionService.detectLoginFormScript()
+            )
+            let hasLoginForm: Bool = {
+                if let json = detectRaw as? String,
+                   let data = json.data(using: .utf8),
+                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let flag = dict["hasLoginForm"] as? Bool {
+                    return flag
+                }
+                return false
+            }()
+            guard hasLoginForm else { return }
+
+            guard let context = self.modelContext else { return }
+            let domainLower = domain.lowercased()
+            let domainVariants = BrowserViewModel.autofillDomainCandidates(for: domainLower)
+            let descriptor = FetchDescriptor<Credential>(
+                sortBy: [
+                    SortDescriptor(\.lastUsedAt, order: .reverse),
+                    SortDescriptor(\.usageCount, order: .reverse),
+                    SortDescriptor(\.updatedAt, order: .reverse)
+                ]
+            )
+            let all = (try? context.fetch(descriptor)) ?? []
+            guard let match = all.first(where: { domainVariants.contains($0.domain.lowercased()) }) else {
+                return
+            }
+            guard let password = KeychainService.shared.getPassword(for: match.id), !password.isEmpty else {
+                return
+            }
+
+            let siteSetting = self.browserViewModel?.fetchSiteSetting(for: domainLower)
+            let fillScript = JavaScriptInjectionService.fillCredentialScript(
+                username: match.username,
+                password: password,
+                usernameSelector: siteSetting?.usernameSelector,
+                passwordSelector: siteSetting?.passwordSelector,
+                suppressKeyboard: true
+            )
+            let fillRaw = try? await webView.evaluateJavaScript(fillScript)
+            let filledCount: Int = {
+                if let json = fillRaw as? String,
+                   let data = json.data(using: .utf8),
+                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let count = dict["filled"] as? Int {
+                    return count
+                }
+                return 0
+            }()
+            guard filledCount > 0 else { return }
+
+            match.lastUsedAt = Date()
+            match.usageCount += 1
+            try? context.save()
+
+            if let siteSetting, siteSetting.isAutoLoginEnabled {
+                let submit = JavaScriptInjectionService.submitFormScript(
+                    submitSelector: siteSetting.submitButtonSelector
+                )
+                _ = try? await webView.evaluateJavaScript(submit)
+            } else {
+                self.browserViewModel?.showToast("Filled login for \(match.username)")
+            }
+        }
+    }
+
+    /// Offers to save a manually submitted login from a multi-window cell.
+    func detectAndOfferSaveQuad(session: QuadSession) {
+        let offerEnabled = UserDefaults.standard.object(forKey: "offerToSavePasswords") as? Bool ?? true
+        guard offerEnabled else { return }
+        let domain = session.domain
+        guard !domain.isEmpty, browserViewModel?.isDomainExcluded(domain) == false else { return }
+
+        let script = JavaScriptInjectionService.extractFilledCredentialsScript()
+        session.webView?.evaluateJavaScript(script) { [weak self] result, _ in
+            Task { @MainActor in
+                guard let self, let json = result as? String,
+                      let data = json.data(using: .utf8),
+                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let found = dict["found"] as? Bool, found,
+                      let username = dict["username"] as? String, !username.isEmpty,
+                      let password = dict["password"] as? String, !password.isEmpty else { return }
+
+                guard let context = self.modelContext else { return }
+                let domainLower = domain.lowercased()
+                let descriptor = FetchDescriptor<Credential>(
+                    predicate: #Predicate<Credential> {
+                        $0.username == username && $0.domain == domainLower
+                    }
+                )
+                let alreadyExists = (try? context.fetch(descriptor).first) != nil
+                if !alreadyExists {
+                    self.browserViewModel?.detectedUsername = username
+                    self.browserViewModel?.detectedPassword = password
+                    self.browserViewModel?.detectedDomain = domainLower
+                    self.browserViewModel?.isShowingSaveCredentialAlert = true
+                }
+            }
+        }
     }
 
     private func navigate(_ session: QuadSession, to url: URL) {
@@ -309,6 +441,10 @@ final class QuadController {
         if s.rcrTotal > 0 && s.rcrIndex < s.rcrTotal {
             s.rcrRunning = true
             s.rcrStatus = .navigating
+            s.webView?.evaluateJavaScript(
+                JavaScriptInjectionService.rcrScrollEnableScript(),
+                completionHandler: nil
+            )
             Task { await self.runCurrent(session: s) }
         } else {
             s.rcrRunning = false
@@ -324,6 +460,12 @@ final class QuadController {
             s.rcrExtraSubmitsInFlight = false
             s.webView?.evaluateJavaScript(
                 JavaScriptInjectionService.rcrUninstallObserverScript(),
+                completionHandler: nil
+            )
+        }
+        for s in activeSessions {
+            s.webView?.evaluateJavaScript(
+                JavaScriptInjectionService.rcrScrollDisableScript(),
                 completionHandler: nil
             )
         }
@@ -570,25 +712,16 @@ final class QuadController {
 
         if hasTempDisabled {
             captureAndRecord(session: s, credential: credential, password: password, status: .tempDisabled)
-            let hasMore = s.rcrPasswords.count > 1
-            if hasMore {
+            // Park the credential for its cooldown only when more passwords
+            // remain; with one password it advances like a normal failure.
+            if s.rcrPasswords.count > 1 {
                 TempDisabledStore.shared.markDisabled(credentialID: credential.id)
                 browserViewModel?.showToast("Temp-disabled — \(credential.username)")
-                s.rcrCompletedIDs.insert(credential.id)
-                s.rcrIndex += 1
-                s.rcrPasswordIndex = 0
-                Task { await self.runCurrent(session: s) }
-            } else {
-                if s.rcrPasswordIndex + 1 < s.rcrPasswords.count {
-                    s.rcrPasswordIndex += 1
-                    Task { await self.attemptFill(session: s) }
-                } else {
-                    s.rcrCompletedIDs.insert(credential.id)
-                    s.rcrIndex += 1
-                    s.rcrPasswordIndex = 0
-                    Task { await self.runCurrent(session: s) }
-                }
             }
+            s.rcrCompletedIDs.insert(credential.id)
+            s.rcrIndex += 1
+            s.rcrPasswordIndex = 0
+            Task { await self.runCurrent(session: s) }
             return
         }
 
@@ -672,7 +805,6 @@ final class QuadController {
         guard allDone else { return }
         let totalSuccess = enabledSessions.reduce(0) { $0 + $1.rcrSuccessCount }
         let totalTried = enabledSessions.reduce(0) { $0 + $1.rcrTotal }
-        lastCompletedAt = Date()
         browserViewModel?.showToast("Quad RCR complete — \(totalSuccess) hits / \(totalTried) tried")
     }
 
@@ -776,6 +908,10 @@ final class QuadController {
 
     private struct LaneState {
         var credentials: [Credential] = []
+        /// Credentials already finished against both target sites when this
+        /// run (re)started. Skipped during assignment; their completed count
+        /// was backfilled at start so pause→resume keeps the display honest.
+        var skipIDs: Set<String> = []
         var index: Int = 0
         var resultA: AttemptRecord.Status?
         var resultB: AttemptRecord.Status?
@@ -801,6 +937,34 @@ final class QuadController {
 
     /// Number of A/B lane pairs available for dual-site RCR.
     var laneCount: Int { laneSessionAIndices.count }
+
+    /// Compact-bar progress across every dual-site lane — sums the per-lane
+    /// completed and total counters so 6/8/9/12-window grids never show only
+    /// the first pair's numbers.
+    var dualOverallProgress: (completed: Int, total: Int) {
+        Self.overallProgress(
+            completedPerLane: laneCompletedCounts,
+            totalsPerLane: laneStates.map { $0.credentials.count }
+        )
+    }
+
+    /// Sums per-lane completed/total counters into one overall pair.
+    nonisolated static func overallProgress(
+        completedPerLane: [Int],
+        totalsPerLane: [Int]
+    ) -> (completed: Int, total: Int) {
+        (completedPerLane.reduce(0, +), totalsPerLane.reduce(0, +))
+    }
+
+    /// Backfills per-lane completed counts for a resumed dual run: counts
+    /// each lane's credentials that were already finished against both
+    /// target sites.
+    nonisolated static func laneBackfillCounts(
+        slices: [[String]],
+        finishedIDs: Set<String>
+    ) -> [Int] {
+        slices.map { slice in slice.filter { finishedIDs.contains($0) }.count }
+    }
 
     /// Rebuilds lane pairings from the current `targetSiteIndex` assignments.
     /// Each lane pairs one Site A session with one Site B session, in index
@@ -867,7 +1031,7 @@ final class QuadController {
             }
         }
 
-        var pool = eligiblePool().filter { cred in
+        func finishedBoth(_ cred: Credential) -> Bool {
             let pwCount = KeychainService.shared.getPasswords(for: cred.id).count
             let doneA = tracker.credentialIsFinished(
                 context: context, credentialID: cred.id, targetDomain: domainA, totalPasswords: pwCount
@@ -875,19 +1039,7 @@ final class QuadController {
             let doneB = tracker.credentialIsFinished(
                 context: context, credentialID: cred.id, targetDomain: domainB, totalPasswords: pwCount
             )
-            return !(doneA && doneB)
-        }
-
-        if pool.isEmpty {
-            // The whole vault already finished against both URLs — restart clean.
-            tracker.clearAttempts(context: context, targetDomain: domainA)
-            tracker.clearAttempts(context: context, targetDomain: domainB)
-            pool = eligiblePool()
-        }
-
-        guard !pool.isEmpty else {
-            browserViewModel?.showToast("Vault is empty")
-            return
+            return doneA && doneB
         }
 
         let lanes = laneSessionAIndices.count
@@ -896,12 +1048,28 @@ final class QuadController {
             return
         }
 
-        // Pre-balance: round-robin credentials across lanes so each lane
-        // gets either floor(N/lanes) or ceil(N/lanes) — guaranteed equal
-        // to within one credential, no matter the vault size or lane count.
-        var laneSlices: [[Credential]] = Array(repeating: [], count: lanes)
-        for (i, cred) in pool.enumerated() {
-            laneSlices[i % lanes].append(cred)
+        let eligible = eligiblePool()
+        guard !eligible.isEmpty else {
+            browserViewModel?.showToast("Vault is empty")
+            return
+        }
+
+        let finishedBeforeRestart = eligible.filter { finishedBoth($0) }
+        let restartingClean = finishedBeforeRestart.count == eligible.count
+        if restartingClean {
+            // The whole vault already finished against both URLs — restart clean.
+            tracker.clearAttempts(context: context, targetDomain: domainA)
+            tracker.clearAttempts(context: context, targetDomain: domainB)
+        }
+        let previouslyFinishedIDs: Set<String> = restartingClean
+            ? []
+            : Set(finishedBeforeRestart.map(\.id))
+
+        // Split each lane's FULL share up front so a resumed run still shows
+        // previously-finished credentials in the queue and counters.
+        var fullLaneSlices: [[Credential]] = Array(repeating: [], count: lanes)
+        for (i, cred) in eligible.enumerated() {
+            fullLaneSlices[i % lanes].append(cred)
         }
 
         dualQuadURLA = urlA
@@ -911,25 +1079,45 @@ final class QuadController {
         dualQuadActive = true
         dualNeedsBurn = [:]
         dualCredentialIDBySessionIndex = [:]
-        laneStates = (0..<lanes).map { LaneState(credentials: laneSlices[$0]) }
-        laneCompletedCounts = Array(repeating: 0, count: lanes)
+        laneStates = (0..<lanes).map { lane in
+            let fullSlice = fullLaneSlices[lane]
+            return LaneState(
+                credentials: fullSlice,
+                skipIDs: Set(fullSlice.map(\.id)).intersection(previouslyFinishedIDs)
+            )
+        }
+        // Backfill counters with credentials already finished against BOTH
+        // sites so pause→resume doesn't reset the visible progress.
+        laneCompletedCounts = Self.laneBackfillCounts(
+            slices: fullLaneSlices.map { $0.map(\.id) },
+            finishedIDs: previouslyFinishedIDs
+        )
 
         for lane in 0..<lanes {
-            let slice = laneSlices[lane]
+            let slice = fullLaneSlices[lane]
             let sliceIDs = slice.map(\.id)
             let sliceUsernames = slice.map(\.username)
             let sliceCounts: [Int] = sliceIDs.map { KeychainService.shared.getPasswords(for: $0).count }
+            let skipIDs = laneStates[lane].skipIDs
             for s in [sessionA(forLane: lane), sessionB(forLane: lane)] {
                 s.rcrQueueIDs = sliceIDs
                 s.rcrQueueUsernames = sliceUsernames
                 s.rcrQueuePasswordCounts = sliceCounts
                 s.rcrTotal = slice.count
-                s.rcrCompletedIDs = []
+                s.rcrCompletedIDs = skipIDs
                 s.rcrIndex = 0
                 s.rcrSuccessCount = 0
                 s.rcrAwaitingNavigation = false
                 s.rcrExtraSubmitsInFlight = false
             }
+        }
+
+        // Human-like scrolling only runs while an automated run is active.
+        for s in activeSessions {
+            s.webView?.evaluateJavaScript(
+                JavaScriptInjectionService.rcrScrollEnableScript(),
+                completionHandler: nil
+            )
         }
 
         for lane in 0..<lanes {
@@ -944,6 +1132,16 @@ final class QuadController {
         guard dualQuadActive else { return }
         let sA = sessionA(forLane: lane)
         let sB = sessionB(forLane: lane)
+
+        // Skip credentials already finished against both sites when this
+        // run started — they're counted via the backfilled counter, not
+        // re-tested.
+        while laneStates[lane].index < laneStates[lane].credentials.count,
+              laneStates[lane].skipIDs.contains(
+                  laneStates[lane].credentials[laneStates[lane].index].id
+              ) {
+            laneStates[lane].index += 1
+        }
 
         guard laneStates[lane].index < laneStates[lane].credentials.count else {
             sA.rcrRunning = false
@@ -1191,17 +1389,11 @@ final class QuadController {
 
         if hasTempDisabled {
             captureAndRecord(session: s, credential: credential, password: password, status: .tempDisabled)
-            let hasMultiplePasswords = s.rcrPasswords.count > 1
-            if hasMultiplePasswords {
+            if s.rcrPasswords.count > 1 {
                 TempDisabledStore.shared.markDisabled(credentialID: credential.id)
                 browserViewModel?.showToast("Temp-disabled — \(credential.username)")
-                finishDualSide(session: s, lane: lane, status: .tempDisabled)
-            } else if s.rcrPasswordIndex + 1 < s.rcrPasswords.count {
-                s.rcrPasswordIndex += 1
-                Task { await self.attemptFillDual(session: s, lane: lane) }
-            } else {
-                finishDualSide(session: s, lane: lane, status: .tempDisabled)
             }
+            finishDualSide(session: s, lane: lane, status: .tempDisabled)
             return
         }
 
@@ -1279,7 +1471,6 @@ final class QuadController {
         let stillWorking = enabledSessions.contains { $0.rcrRunning && $0.rcrStatus != .finished }
         guard !stillWorking else { return }
         dualQuadActive = false
-        lastCompletedAt = Date()
         let totalSuccess = enabledSessions.reduce(0) { $0 + $1.rcrSuccessCount }
         let totalTried = laneStates.reduce(0) { $0 + $1.credentials.count }
         browserViewModel?.showToast("Dual RCR complete — \(totalSuccess) hits / \(totalTried) tried")

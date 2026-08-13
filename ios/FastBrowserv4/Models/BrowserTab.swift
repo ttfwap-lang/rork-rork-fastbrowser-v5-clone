@@ -53,11 +53,4 @@ class BrowserTab: Identifiable {
             }
         }
     }
-
-    func suspendWebView() {
-        captureSnapshot()
-        webView?.stopLoading()
-        webView = nil
-        isWebViewActive = false
-    }
 }

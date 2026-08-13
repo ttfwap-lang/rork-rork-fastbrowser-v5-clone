@@ -39,9 +39,8 @@ struct VaultView: View {
     /// credential in each group (e.g. most-recently-used domain first for
     /// `.recentlyUsed`) so the top of the list is always the most relevant.
     private var groupedCredentials: [(String, [Credential])] {
-        // Vault is locked to strict alphabetical order (domain, then username)
-        // so the RCR queue and the on-screen list always agree on position.
-        let sorted = VaultViewModel.sortCredentials(filteredCredentials, by: .domain)
+        // Display order only — RCR runs keep their own fixed queue order.
+        let sorted = VaultViewModel.sortCredentials(filteredCredentials, by: viewModel.sortOption)
         var order: [String] = []
         var groups: [String: [Credential]] = [:]
         for credential in sorted {
@@ -216,6 +215,23 @@ struct VaultView: View {
                 }
             } else {
                 Button("Done") { dismiss() }
+            }
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            Menu {
+                ForEach(VaultSortOption.allCases) { option in
+                    Button {
+                        viewModel.sortOption = option
+                    } label: {
+                        if viewModel.sortOption == option {
+                            Label(option.rawValue, systemImage: "checkmark")
+                        } else {
+                            Label(option.rawValue, systemImage: option.systemImage)
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "arrow.up.arrow.down")
             }
         }
         ToolbarItem(placement: .topBarTrailing) {

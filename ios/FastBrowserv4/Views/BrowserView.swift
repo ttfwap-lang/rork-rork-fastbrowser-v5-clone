@@ -76,7 +76,6 @@ struct BrowserView: View {
         }
         .sheet(item: $viewModel.presentedSheet, onDismiss: {
             viewModel.reloadExcludedDomains()
-            viewModel.invalidateCredentialCache()
         }) { sheet in
             sheetContent(for: sheet)
         }
@@ -84,7 +83,7 @@ struct BrowserView: View {
             Button("Save") { viewModel.saveDetectedCredential() }
             Button("Not Now", role: .cancel) {}
         } message: {
-            Text("Save credentials for \(viewModel.activeTab?.domain ?? "this site")?\nUsername: \(viewModel.detectedUsername)")
+            Text("Save credentials for \(viewModel.detectedDomain.isEmpty ? (viewModel.activeTab?.domain ?? "this site") : viewModel.detectedDomain)?\nUsername: \(viewModel.detectedUsername)")
         }
     }
 
@@ -98,7 +97,7 @@ struct BrowserView: View {
         case .vault:
             NavigationStack { VaultView() }
         case .siteSettings(let domain):
-            NavigationStack { SiteSettingsView(domain: domain) }
+            NavigationStack { SiteSettingsView(domain: domain, viewModel: viewModel) }
         case .settings:
             NavigationStack { AppSettingsView() }
         case .bookmarks:
@@ -169,7 +168,7 @@ struct BrowserView: View {
 
                 Image(systemName: "lock.fill")
                     .font(.caption)
-                    .foregroundStyle(viewModel.activeTab?.url?.scheme == "https" ? .green : .secondary)
+                    .foregroundStyle(viewModel.currentPageURL?.scheme == "https" ? .green : .secondary)
 
                 TextField("Search or enter URL", text: isBarB ? $viewModel.urlBarTextB : $viewModel.urlBarText)
                     .textFieldStyle(.plain)
@@ -243,7 +242,11 @@ struct BrowserView: View {
                     Button("Add Bookmark", systemImage: "bookmark") {
                         viewModel.addBookmark()
                     }
-                    Button("Share", systemImage: "square.and.arrow.up") {}
+                    if let shareURL = viewModel.currentPageURL {
+                        ShareLink(item: shareURL) {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                        }
+                    }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                         .font(.body)
@@ -525,10 +528,10 @@ struct BrowserView: View {
         let active = viewModel.quadController.activeSessions
         let success = active.reduce(0) { $0 + $1.rcrSuccessCount }
         if viewModel.isDualQuadMode {
-            // Dual-site sessions all share the same queue snapshot, so any
-            // one session's completed/total reflects the whole run.
-            let first = active.first
-            return (first?.rcrCompletedIDs.count ?? 0, first?.rcrTotal ?? 0, success)
+            // Sum every lane pair's completed/total — using only the first
+            // session's queue showed just one pair's progress.
+            let progress = viewModel.quadController.dualOverallProgress
+            return (progress.completed, progress.total, success)
         }
         return (
             active.reduce(0) { $0 + $1.rcrCompletedIDs.count },

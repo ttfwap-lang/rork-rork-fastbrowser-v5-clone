@@ -25,7 +25,7 @@ class ExcludedDomain {
     /// leading `www.` stripped). Matches the normalization performed by
     /// `CredentialImportService.extractDomain` / `BrowserTab.domain` so that
     /// excluded entries reliably hide credentials and disable autofill.
-    static func canonicalize(_ input: String) -> String {
+    nonisolated static func canonicalize(_ input: String) -> String {
         let trimmed = input
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()

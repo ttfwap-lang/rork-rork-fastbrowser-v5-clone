@@ -47,6 +47,9 @@ class BrowserViewModel {
     var toastVisible: Bool = false
     var detectedUsername: String = ""
     var detectedPassword: String = ""
+    /// Domain the detected login belongs to. Used by the save flow in both
+    /// single-window and multi-window mode (quad cells report their own).
+    var detectedDomain: String = ""
     var isAutoSubmitting: Bool = false
 
     // MARK: - RCR (run-credentials-run) state
@@ -73,10 +76,6 @@ class BrowserViewModel {
     /// returned `failed` (non-success / non-disabled). Off by default —
     /// resume-safe runs skip every terminally-attempted password.
     var retryFailed: Bool = false
-    /// Most-recent run completion timestamp — drives the "View Results"
-    /// affordance on the queue pill.
-    var rcrLastCompletedAt: Date?
-
     /// The URL captured when the user tapped RCR.
     var rcrTargetURL: URL?
     private var rcrQueueIDs: [String] = []
@@ -148,6 +147,16 @@ class BrowserViewModel {
         return tabs[activeTabIndex]
     }
 
+    /// URL the shared toolbar should reflect — the focused multi-window
+    /// tile's page in quad mode, otherwise the active tab's page.
+    var currentPageURL: URL? {
+        if isQuadMode {
+            return quadController.focusedSession.webView?.url
+                ?? quadController.focusedSession.url
+        }
+        return activeTab?.webView?.url ?? activeTab?.url
+    }
+
     /// Default page every new tab opens to.
     static let defaultHomeURL: URL = URL(string: "https://www.ignitioncasino.ooo/login")!
 
@@ -159,7 +168,6 @@ class BrowserViewModel {
             addNewTab()
         }
         quadController.setup(modelContext: modelContext, browser: self)
-        purgeSeededVaultIfNeeded(context: modelContext)
         startCookiePurgeTimer()
         resetURLBarTimer()
     }
@@ -244,30 +252,6 @@ class BrowserViewModel {
         tab.canGoForward = false
         urlBarText = ""
         resetURLBarTimer()
-    }
-
-    // MARK: - Vault purge
-
-    /// One-time cleanup that empties the vault of the old pre-seeded
-    /// credentials. Previous builds auto-populated demo logins on first
-    /// launch; this removes every stored credential (and its keychain entry)
-    /// exactly once so the vault starts empty. Credentials the user adds
-    /// afterwards are untouched because the purge only runs while its flag is
-    /// unset.
-    private func purgeSeededVaultIfNeeded(context: ModelContext) {
-        let purgeKey = "vaultSeedPurgedV1"
-        guard !UserDefaults.standard.bool(forKey: purgeKey) else { return }
-        let descriptor = FetchDescriptor<Credential>()
-        let ids = ((try? context.fetch(descriptor)) ?? []).map { $0.id }
-        if !ids.isEmpty {
-            try? context.delete(model: Credential.self)
-            try? context.save()
-            // Keychain deletes are serial — run them off-main.
-            Task.detached {
-                for id in ids { KeychainService.shared.deletePassword(for: id) }
-            }
-        }
-        UserDefaults.standard.set(true, forKey: purgeKey)
     }
 
     func closeTab(at index: Int) {
@@ -586,24 +570,33 @@ class BrowserViewModel {
         }
     }
 
+    /// Hourly privacy sweep. HttpOnly cookies — which includes Google's
+    /// tracking cookies — are invisible to page JavaScript by design, so
+    /// this deletes them through the system cookie-store API instead.
     private func purgeTrackingCookies() async {
-        let script = JavaScriptInjectionService.deleteTrackingCookiesScript()
-        activeTab?.webView?.evaluateJavaScript(script, completionHandler: nil)
+        var storeIDs: Set<UUID> = []
+        if let tab = activeTab { storeIDs.insert(tab.dataStoreID) }
         if isQuadMode {
-            for s in quadController.sessions {
-                s.webView?.evaluateJavaScript(script, completionHandler: nil)
+            for session in quadController.sessions { storeIDs.insert(session.storeID) }
+        }
+        for id in storeIDs {
+            let cookieStore = WKWebsiteDataStore(forIdentifier: id).httpCookieStore
+            guard let cookies = try? await cookieStore.allCookies() else { continue }
+            for cookie in cookies where Self.trackingCookieNames.contains(cookie.name) {
+                await cookieStore.deleteCookie(cookie)
             }
         }
     }
 
-    // MARK: - Caches retained for site settings only.
+    /// Cookie names targeted by the hourly sweep — the same list the old
+    /// JavaScript sweep used, now deleted through the native cookie store.
+    private static let trackingCookieNames: Set<String> = [
+        "__Secure-3PSID", "__Secure-3PAPISID", "__Secure-3PSIDCC",
+        "_ga", "_gid", "_gat", "NID", "SID", "HSID", "APISID",
+        "SAPISID", "SSID", "SIDCC", "__Secure-1PSID", "__Secure-1PAPISID",
+    ]
 
-    func invalidateCredentialCache(for domain: String? = nil) {
-        // Site-matching is gone, but kept as a no-op so existing call sites
-        // (e.g. sheet `onDismiss`) stay valid.
-        _ = domain
-    }
-
+    // MARK: - Site-setting cache
     func fetchSiteSetting(for domain: String) -> SiteSetting? {
         let lowDomain = domain.lowercased()
         if let cached = siteSettingCache[lowDomain] {
@@ -847,7 +840,7 @@ class BrowserViewModel {
 
             guard let context = self.modelContext else { return }
             let domainLower = domain.lowercased()
-            let domainVariants = self.autofillDomainCandidates(for: domainLower)
+            let domainVariants = Self.autofillDomainCandidates(for: domainLower)
             let descriptor = FetchDescriptor<Credential>(
                 sortBy: [
                     SortDescriptor(\.lastUsedAt, order: .reverse),
@@ -895,8 +888,9 @@ class BrowserViewModel {
     }
 
     /// Builds a small set of domain aliases so `example.com` also matches a
-    /// vault entry stored as `www.example.com` (and vice versa).
-    private func autofillDomainCandidates(for domain: String) -> Set<String> {
+    /// vault entry stored as `www.example.com` (and vice versa). Shared by
+    /// the single-window and multi-window autofill paths.
+    static func autofillDomainCandidates(for domain: String) -> Set<String> {
         var candidates: Set<String> = [domain]
         if domain.hasPrefix("www.") {
             candidates.insert(String(domain.dropFirst(4)))
@@ -937,6 +931,7 @@ class BrowserViewModel {
                 if !alreadyExists {
                     self.detectedUsername = username
                     self.detectedPassword = password
+                    self.detectedDomain = domainLower
                     self.isShowingSaveCredentialAlert = true
                 }
             }
@@ -944,11 +939,13 @@ class BrowserViewModel {
     }
 
     func saveDetectedCredential() {
-        guard let context = modelContext, let domain = activeTab?.domain else { return }
+        let domain = detectedDomain.isEmpty ? (activeTab?.domain ?? "") : detectedDomain
+        guard let context = modelContext, !domain.isEmpty else { return }
         guard !isDomainExcluded(domain) else {
             showToast("Domain is on the exclude list")
             detectedUsername = ""
             detectedPassword = ""
+            detectedDomain = ""
             return
         }
         let credential = Credential(domain: domain, username: detectedUsername)
@@ -957,6 +954,7 @@ class BrowserViewModel {
         showToast("Credential saved for \(domain)")
         detectedUsername = ""
         detectedPassword = ""
+        detectedDomain = ""
     }
 
     // MARK: - RCR
@@ -1052,18 +1050,40 @@ class BrowserViewModel {
             return
         }
 
-        // Build the queue snapshot. Fetch password counts once, off the
-        // main thread, so the pill has correct "N pw" badges immediately.
+        // Fetch password counts off the main thread so a large vault can't
+        // freeze the UI at run start; the rest of the setup continues in
+        // `beginRCRRun`.
         let credIDs = queue.map(\.id)
         let usernames = queue.map(\.username)
-        let counts: [Int] = credIDs.map { id in
-            KeychainService.shared.getPasswords(for: id).count
+        Task { [weak self] in
+            guard let self else { return }
+            let counts = await Task.detached {
+                credIDs.map { KeychainService.shared.getPasswords(for: $0).count }
+            }.value
+            self.beginRCRRun(
+                context: context,
+                credIDs: credIDs,
+                usernames: usernames,
+                counts: counts,
+                target: target
+            )
         }
+    }
 
+    /// Continues `startRCR` once password counts are ready: builds the queue
+    /// snapshot, applies the restart/resume rules, and kicks off the first
+    /// credential.
+    private func beginRCRRun(
+        context: ModelContext,
+        credIDs: [String],
+        usernames: [String],
+        counts: [Int],
+        target: URL
+    ) {
         rcrQueueIDs = credIDs
         rcrQueueUsernames = usernames
         rcrQueuePasswordCounts = counts
-        rcrTotal = queue.count
+        rcrTotal = credIDs.count
         rcrCompletedIDs = []
 
         // If the entire vault was previously finished against this same
@@ -1113,6 +1133,11 @@ class BrowserViewModel {
             }
         }
 
+        // Human-like scrolling only runs while an automated run is active.
+        activeTab?.webView?.evaluateJavaScript(
+            JavaScriptInjectionService.rcrScrollEnableScript(),
+            completionHandler: nil
+        )
         isRCRRunning = true
         rcrStatus = .navigating
         Task { await runCurrentCredential() }
@@ -1125,6 +1150,10 @@ class BrowserViewModel {
         rcrTargetURL = nil
         activeTab?.webView?.evaluateJavaScript(
             JavaScriptInjectionService.rcrUninstallObserverScript(),
+            completionHandler: nil
+        )
+        activeTab?.webView?.evaluateJavaScript(
+            JavaScriptInjectionService.rcrScrollDisableScript(),
             completionHandler: nil
         )
         if let reason { showToast(reason) }
@@ -1159,7 +1188,6 @@ class BrowserViewModel {
         }
         guard rcrIndex < rcrQueueIDs.count else {
             rcrStatus = .success
-            rcrLastCompletedAt = Date()
             UserDefaults.standard.removeObject(forKey: rcrLastCompletedKey)
             showToast("RCR complete (\(rcrTotal)/\(rcrTotal))")
             stopRCR()
@@ -1410,34 +1438,24 @@ class BrowserViewModel {
         }
 
         // 2b) Temporary disabled: park the credential for 1 hour ONLY if
-        // it still has more passwords waiting; otherwise treat as a normal
-        // failed attempt.
+        // it still has more passwords waiting; otherwise advance like a
+        // normal failed attempt. (With a single password the "try next"
+        // branch could never run — it is deliberately not special-cased.)
         if hasTempDisabled {
             captureAndRecord(
                 credential: credential,
                 password: password,
                 status: .tempDisabled
             )
-            let hasMore = rcrCurrentPasswords.count > 1
-            if hasMore {
+            if rcrCurrentPasswords.count > 1 {
                 TempDisabledStore.shared.markDisabled(credentialID: credential.id)
                 showToast("Temp-disabled — \(credential.username) (1h cooldown)")
-                persistRCRProgress(completedID: credential.id)
-                rcrCompletedIDs.insert(credential.id)
-                rcrIndex += 1
-                rcrPasswordIndex = 0
-                Task { await runCurrentCredential() }
-            } else {
-                if rcrPasswordIndex + 1 < rcrCurrentPasswords.count {
-                    rcrPasswordIndex += 1
-                    Task { await attemptFill() }
-                } else {
-                    persistRCRProgress(completedID: credential.id)
-                    rcrCompletedIDs.insert(credential.id)
-                    rcrIndex += 1
-                    Task { await runCurrentCredential() }
-                }
             }
+            persistRCRProgress(completedID: credential.id)
+            rcrCompletedIDs.insert(credential.id)
+            rcrIndex += 1
+            rcrPasswordIndex = 0
+            Task { await runCurrentCredential() }
             return
         }
 
@@ -1511,7 +1529,15 @@ class BrowserViewModel {
         }
 
         if let context = modelContext {
-            try? context.delete(model: BrowsingHistoryEntry.self)
+            // Scope the history wipe to the RCR target site — burning a
+            // session mid-run must not erase the user's entire history.
+            let domain = rcrTargetURL.map { ExcludedDomain.canonicalize($0.absoluteString) } ?? ""
+            if !domain.isEmpty {
+                try? context.delete(
+                    model: BrowsingHistoryEntry.self,
+                    where: #Predicate<BrowsingHistoryEntry> { $0.domain == domain }
+                )
+            }
             try? context.save()
         }
         showToast("Burned cookies, cache & history")

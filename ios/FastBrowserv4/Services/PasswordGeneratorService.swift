@@ -19,11 +19,19 @@ struct PasswordGeneratorService {
         let charArray = Array(chars)
         var password = ""
 
+        // Fill the byte buffer from the system CSPRNG. Retry on failure — a
+        // zeroed buffer would silently collapse to one repeated character,
+        // which is a catastrophically weak password.
         var randomBytes = [UInt8](repeating: 0, count: length)
-        _ = SecRandomCopyBytes(kSecRandomDefault, length, &randomBytes)
+        var generated = false
+        for _ in 0..<3 where !generated {
+            generated = SecRandomCopyBytes(kSecRandomDefault, length, &randomBytes) == errSecSuccess
+        }
+        guard generated else { return "" }
 
         for i in 0..<length {
-            let index = Int(randomBytes[i]) % charArray.count
+            // Unbiased index: scale the byte into [0, count) without modulo.
+            let index = Int(UInt32(randomBytes[i]) * UInt32(charArray.count) / 256)
             password.append(charArray[index])
         }
 
