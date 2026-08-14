@@ -15,6 +15,9 @@ struct ImportCredentialsView: View {
     @State private var pasteText: String = ""
     @State private var comboSeparator: ComboListSeparator = .auto
     @State private var comboFormat: ComboListFormat = .email
+    /// Debounced parse result for the paste preview — re-parsing a huge
+    /// paste synchronously on every keystroke freezes typing.
+    @State private var comboPreview = ComboListPreview(credentialCount: 0, passwordCount: 0, skippedCount: 0, mergedCount: 0)
 
     enum ImportTab: String, CaseIterable, Identifiable {
         case file = "File"
@@ -59,6 +62,20 @@ struct ImportCredentialsView: View {
             allowsMultipleSelection: false
         ) { result in
             handleFileImport(result)
+        }
+        .task(id: ComboPreviewInput(text: pasteText, separator: comboSeparator, format: comboFormat)) {
+            // Debounce: wait for a typing pause, then parse off the main
+            // thread so a 10k-line paste doesn't hitch every keystroke.
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            let text = pasteText
+            let separator = comboSeparator
+            let format = comboFormat
+            let result = await Task.detached {
+                CredentialImportService.comboListPreview(text, separator: separator, format: format)
+            }.value
+            guard !Task.isCancelled else { return }
+            comboPreview = result
         }
     }
 
@@ -163,11 +180,7 @@ struct ImportCredentialsView: View {
             .buttonStyle(.bordered)
         }
 
-        let preview = CredentialImportService.comboListPreview(
-            pasteText,
-            separator: comboSeparator,
-            format: comboFormat
-        )
+        let preview = comboPreview
 
         if !pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             Section("Preview") {
@@ -386,4 +399,13 @@ struct ImportCredentialsView: View {
         }
         return "Imported \(newCount) credentials (\(passwordTotal) passwords)"
     }
+}
+
+/// Identity for the debounced combo-list preview parse. Changes whenever
+/// the text, separator, or format changes; `.task(id:)` cancels the
+/// previous parse automatically.
+private struct ComboPreviewInput: Equatable {
+    let text: String
+    let separator: ComboListSeparator
+    let format: ComboListFormat
 }

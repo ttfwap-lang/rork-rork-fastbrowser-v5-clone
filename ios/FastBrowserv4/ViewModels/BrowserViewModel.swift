@@ -30,8 +30,6 @@ struct RCRQueueItem: Identifiable, Hashable {
     let id: String          // credentialID
     let username: String
     let passwordCount: Int
-    var isCompleted: Bool
-    var isCurrent: Bool
 }
 
 @Observable
@@ -50,7 +48,6 @@ class BrowserViewModel {
     /// Domain the detected login belongs to. Used by the save flow in both
     /// single-window and multi-window mode (quad cells report their own).
     var detectedDomain: String = ""
-    var isAutoSubmitting: Bool = false
 
     // MARK: - RCR (run-credentials-run) state
     enum RCRStatus {
@@ -84,6 +81,18 @@ class BrowserViewModel {
     private var rcrAwaitingNavigation: Bool = false
     private var isQuadToggling: Bool = false
     private let rcrLastCompletedKey = "rcrLastCompletedID"
+    /// Re-entrancy latch: set synchronously the moment the user taps RCR,
+    /// before the off-main keychain preflight completes, so a double-tap
+    /// can't stack two overlapping runs. Cleared when the run begins and
+    /// whenever the run is stopped.
+    private(set) var isStartingRCR: Bool = false
+    private var rcrStartGeneration: Int = 0
+    /// Per-attempt watchdog: fires when a navigation or the post-submit
+    /// observation yields no page state within the timeout (failed load,
+    /// dead page, wedged web process). Without it the runner sits in
+    /// "watching" forever with no recovery.
+    private var rcrWatchdogTask: Task<Void, Never>?
+    private static let rcrWatchdogTimeout: Duration = .seconds(12)
 
     /// True while the user is editing the URL bar — suppresses programmatic
     /// overwrites from navigation events so the user's in-progress text is
@@ -138,9 +147,13 @@ class BrowserViewModel {
     private var siteSettingCache: [String: SiteSetting?] = [:]
     private var excludedDomainCache: Set<String> = []
     private var excludedDomainCacheLoaded: Bool = false
-    private var historyDebounceTask: Task<Void, Never>?
-    private var lastHistoryURL: String = ""
+    /// History dedupe/debounce, keyed by tab id so two tabs loading the
+    /// same URL back-to-back don't suppress each other's entries (or cancel
+    /// each other's pending writes).
+    private var historyDebounceTasks: [String: Task<Void, Never>] = [:]
+    private var lastHistoryURLByTab: [String: String] = [:]
     private var sureLoginTask: Task<Void, Never>?
+    private var toastGeneration: Int = 0
 
     var activeTab: BrowserTab? {
         guard tabs.indices.contains(activeTabIndex) else { return nil }
@@ -222,6 +235,9 @@ class BrowserViewModel {
     /// (its `url` stays nil until the user picks a shortcut or types an
     /// address).
     func addNewTab(url: URL? = nil) {
+        // A sure-login retry loop belongs to the tab it started on — it must
+        // not keep firing submits at whatever tab becomes active next.
+        sureLoginTask?.cancel()
         let tab = BrowserTab(url: url)
         tabs.append(tab)
         activeTabIndex = tabs.count - 1
@@ -240,9 +256,10 @@ class BrowserViewModel {
     /// web view so the home grid is shown again.
     func goHome() {
         guard !isRCRRunning, !quadController.anyRCRRunning else {
-            showToast("Stop RCR before going home")
+            showToast("Stop RCR before going home", force: true)
             return
         }
+        sureLoginTask?.cancel()
         if isQuadMode { setQuadMode(.single) }
         guard let tab = activeTab else { addNewTab(); return }
         tab.webView?.stopLoading()
@@ -255,9 +272,19 @@ class BrowserViewModel {
     }
 
     func closeTab(at index: Int) {
+        // Closing the RCR tab mid-run would strand the runner on a nil web
+        // view (or silently move the run onto whatever tab becomes active).
+        guard !isRCRRunning else {
+            showToast("Stop RCR before closing tabs", force: true)
+            return
+        }
         guard tabs.count > 1, tabs.indices.contains(index) else { return }
+        sureLoginTask?.cancel()
         let activeTabID = activeTab?.id
         let closing = tabs[index]
+        historyDebounceTasks[closing.id]?.cancel()
+        historyDebounceTasks[closing.id] = nil
+        lastHistoryURLByTab[closing.id] = nil
         closing.webView?.stopLoading()
         closing.webView = nil
         let storeID = closing.dataStoreID
@@ -279,7 +306,14 @@ class BrowserViewModel {
     }
 
     func switchToTab(at index: Int) {
+        // The runner drives the active tab — switching mid-run would move
+        // the run onto a different tab's identity.
+        guard !isRCRRunning else {
+            showToast("Stop RCR before switching tabs", force: true)
+            return
+        }
         guard tabs.indices.contains(index) else { return }
+        sureLoginTask?.cancel()
         let oldTab = activeTab
         oldTab?.captureSnapshot()
 
@@ -294,7 +328,10 @@ class BrowserViewModel {
     func navigateTo(_ input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let validURL = resolveURL(from: trimmed) else { return }
+        // A pending sure-login retry loop must not fire its submits onto
+        // the page we're navigating away to.
+        sureLoginTask?.cancel()
+        guard let validURL = Self.resolveURL(from: trimmed) else { return }
         urlBarText = validURL.absoluteString
         resetURLBarTimer()
 
@@ -320,7 +357,7 @@ class BrowserViewModel {
     func navigateToB(_ input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, isDualQuadMode else { return }
-        guard let validURL = resolveURL(from: trimmed) else { return }
+        guard let validURL = Self.resolveURL(from: trimmed) else { return }
         urlBarTextB = validURL.absoluteString
         resetURLBarBTimer()
         quadController.navigateTargetSite(to: validURL, targetSiteIndex: 1)
@@ -328,25 +365,29 @@ class BrowserViewModel {
         UserDefaults.standard.set(validURL.absoluteString, forKey: Self.dualQuadURL_B_Key)
     }
 
-    /// Shared URL resolution — returns a valid URL or nil.
-    private func resolveURL(from trimmed: String) -> URL? {
+    /// Shared URL resolution — returns a valid http(s) URL or nil.
+    /// Anything that isn't a web address becomes a search query;
+    /// `file:`/`data:`/`about:` and friends are rejected outright so local
+    /// or inline content can never load inside a web view that carries our
+    /// script message handlers.
+    nonisolated static func resolveURL(from trimmed: String) -> URL? {
         let lower = trimmed.lowercased()
         let url: URL?
         if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
             url = URL(string: trimmed) ?? encodedURL(from: trimmed)
-        } else if lower.hasPrefix("about:") || lower.hasPrefix("file:") || lower.hasPrefix("data:") {
-            url = URL(string: trimmed)
         } else if looksLikeHost(trimmed) {
             url = URL(string: "https://\(trimmed)") ?? encodedURL(from: "https://\(trimmed)")
         } else {
             let query = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? trimmed
             url = URL(string: "\(searchEngineBaseURL)q=\(query)")
         }
-        guard let validURL = url, validURL.scheme != nil else { return nil }
+        guard let validURL = url,
+              let scheme = validURL.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else { return nil }
         return validURL
     }
 
-    private var searchEngineBaseURL: String {
+    nonisolated private static var searchEngineBaseURL: String {
         switch UserDefaults.standard.string(forKey: "defaultSearchEngine") ?? "Google" {
         case "DuckDuckGo": return "https://duckduckgo.com/?q="
         case "Bing": return "https://www.bing.com/search?q="
@@ -366,7 +407,7 @@ class BrowserViewModel {
     func setQuadMode(_ newMode: QuadMode) {
         guard !isQuadToggling, newMode != quadMode else { return }
         guard !isRCRRunning, !quadController.anyRCRRunning else {
-            showToast("Stop RCR before switching modes")
+            showToast("Stop RCR before switching modes", force: true)
             return
         }
         isQuadToggling = true
@@ -398,7 +439,7 @@ class BrowserViewModel {
 
         case .grid(let size, let dual):
             guard !dual || size.supportsDualSite else {
-                showToast("This grid size supports one target site only")
+                showToast("This grid size supports one target site only", force: true)
                 return
             }
             quadController.setGridSize(size)
@@ -440,7 +481,7 @@ class BrowserViewModel {
     func setDualSiteSplitPattern(_ pattern: DualSiteSplitPattern) {
         guard pattern != dualSiteSplitPattern else { return }
         guard !isRCRRunning, !quadController.anyRCRRunning else {
-            showToast("Stop RCR before changing the split")
+            showToast("Stop RCR before changing the split", force: true)
             return
         }
         dualSiteSplitPattern = pattern
@@ -458,7 +499,7 @@ class BrowserViewModel {
         urlBarTextB = urlB.absoluteString
     }
 
-    private func looksLikeHost(_ s: String) -> Bool {
+    nonisolated private static func looksLikeHost(_ s: String) -> Bool {
         if s.contains(" ") { return false }
         if s.hasPrefix("[") { return true }
         if s.contains(".") { return true }
@@ -467,7 +508,7 @@ class BrowserViewModel {
         return hostPart.lowercased() == "localhost"
     }
 
-    private func encodedURL(from s: String) -> URL? {
+    nonisolated private static func encodedURL(from s: String) -> URL? {
         s.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed)
             .flatMap(URL.init(string:))
     }
@@ -574,11 +615,12 @@ class BrowserViewModel {
     /// tracking cookies — are invisible to page JavaScript by design, so
     /// this deletes them through the system cookie-store API instead.
     private func purgeTrackingCookies() async {
+        // Sweep EVERY open tab and every multi-window store — previously only
+        // the active tab + quad sessions were purged, so trackers survived
+        // indefinitely in background tabs.
         var storeIDs: Set<UUID> = []
-        if let tab = activeTab { storeIDs.insert(tab.dataStoreID) }
-        if isQuadMode {
-            for session in quadController.sessions { storeIDs.insert(session.storeID) }
-        }
+        for tab in tabs { storeIDs.insert(tab.dataStoreID) }
+        for session in quadController.sessions { storeIDs.insert(session.storeID) }
         for id in storeIDs {
             let cookieStore = WKWebsiteDataStore(forIdentifier: id).httpCookieStore
             guard let cookies = try? await cookieStore.allCookies() else { continue }
@@ -641,7 +683,6 @@ class BrowserViewModel {
 
     func performAutoLogin(siteSetting: SiteSetting?) {
         guard let siteSetting, siteSetting.isAutoLoginEnabled else { return }
-        isAutoSubmitting = true
 
         let script = JavaScriptInjectionService.submitFormScript(
             submitSelector: siteSetting.submitButtonSelector
@@ -653,8 +694,6 @@ class BrowserViewModel {
                 self.installLoginResponseObserverIfEnabled(domain: siteSetting.domain)
                 if siteSetting.isSureLoginEnabled {
                     self.startSureLogin(siteSetting: siteSetting)
-                } else {
-                    self.isAutoSubmitting = false
                 }
             }
         }
@@ -703,14 +742,19 @@ class BrowserViewModel {
                 let script = JavaScriptInjectionService.submitFormScript(submitSelector: submitSelector)
                 _ = try? await self.activeTab?.webView?.evaluateJavaScript(script)
             }
-
-            self.isAutoSubmitting = false
         }
     }
 
     // MARK: - Burn
 
     func burnCurrentTab() {
+        // Burning mid-run rips the data store out from under the runner —
+        // the observer dies with it and the attempt would stall. RCR does
+        // its own coordinated burns.
+        guard !isRCRRunning, !quadController.anyRCRRunning else {
+            showToast("Stop RCR before burning", force: true)
+            return
+        }
         if isQuadMode {
             burnQuadFocused()
             return
@@ -756,12 +800,14 @@ class BrowserViewModel {
 
     // MARK: - Debounced History
 
-    func addHistoryEntry(url: String, title: String) {
-        guard url != lastHistoryURL else { return }
-        lastHistoryURL = url
+    func addHistoryEntry(url: String, title: String, tabID: String) {
+        // Dedupe per tab — two tabs loading the same URL in quick succession
+        // must each record their own entry.
+        guard lastHistoryURLByTab[tabID] != url else { return }
+        lastHistoryURLByTab[tabID] = url
 
-        historyDebounceTask?.cancel()
-        historyDebounceTask = Task { [weak self] in
+        historyDebounceTasks[tabID]?.cancel()
+        historyDebounceTasks[tabID] = Task { [weak self] in
             try? await Task.sleep(for: .seconds(0.5))
             guard !Task.isCancelled, let self, let context = self.modelContext else { return }
             let domain = CredentialImportService.extractDomain(from: url)
@@ -772,7 +818,7 @@ class BrowserViewModel {
 
     func addBookmark() {
         guard let context = modelContext else {
-            showToast("Nothing to bookmark")
+            showToast("Nothing to bookmark", force: true)
             return
         }
 
@@ -786,7 +832,7 @@ class BrowserViewModel {
             domain = session.domain
         } else {
             guard let tab = activeTab else {
-                showToast("Nothing to bookmark")
+                showToast("Nothing to bookmark", force: true)
                 return
             }
             urlString = tab.webView?.url?.absoluteString ?? tab.url?.absoluteString
@@ -795,7 +841,7 @@ class BrowserViewModel {
         }
 
         guard let url = urlString, !url.isEmpty else {
-            showToast("Nothing to bookmark")
+            showToast("Nothing to bookmark", force: true)
             return
         }
         let bookmark = Bookmark(url: url, title: title, domain: domain)
@@ -942,7 +988,7 @@ class BrowserViewModel {
         let domain = detectedDomain.isEmpty ? (activeTab?.domain ?? "") : detectedDomain
         guard let context = modelContext, !domain.isEmpty else { return }
         guard !isDomainExcluded(domain) else {
-            showToast("Domain is on the exclude list")
+            showToast("Domain is on the exclude list", force: true)
             detectedUsername = ""
             detectedPassword = ""
             detectedDomain = ""
@@ -961,7 +1007,7 @@ class BrowserViewModel {
 
     func toggleRCR() {
         if isQuadMode {
-            if quadController.anyRCRRunning {
+            if quadController.anyRCRRunning || quadController.isStartingRCR {
                 quadController.stopQuadRCR(reason: "Quad RCR paused")
             } else {
                 if isDualQuadMode {
@@ -969,7 +1015,7 @@ class BrowserViewModel {
                 } else {
                     guard let target = quadController.focusedSession.webView?.url
                         ?? quadController.focusedSession.url else {
-                        showToast("Open a login page in any cell first")
+                        showToast("Open a login page in any cell first", force: true)
                         return
                     }
                     quadController.startQuadRCR(targetURL: target)
@@ -977,7 +1023,7 @@ class BrowserViewModel {
             }
             return
         }
-        if isRCRRunning {
+        if isRCRRunning || isStartingRCR {
             stopRCR(reason: "RCR paused")
         } else {
             startRCR()
@@ -998,9 +1044,7 @@ class BrowserViewModel {
             items.append(RCRQueueItem(
                 id: id,
                 username: username,
-                passwordCount: pwCount,
-                isCompleted: false,
-                isCurrent: i == rcrIndex
+                passwordCount: pwCount
             ))
         }
         return items
@@ -1016,20 +1060,22 @@ class BrowserViewModel {
             items.append(RCRQueueItem(
                 id: id,
                 username: username,
-                passwordCount: pwCount,
-                isCompleted: true,
-                isCurrent: false
+                passwordCount: pwCount
             ))
         }
         return items
     }
 
     func startRCR() {
+        // Re-entrancy latch: the keychain preflight below is async, so
+        // without this a double-tap in that window starts two overlapping
+        // runs fighting over the same tab.
+        guard !isRCRRunning, !isStartingRCR else { return }
         guard let context = modelContext else { return }
         if !excludedDomainCacheLoaded { reloadExcludedDomains() }
 
         guard let target = activeTab?.webView?.url ?? activeTab?.url else {
-            showToast("Open a login page first")
+            showToast("Open a login page first", force: true)
             return
         }
         rcrTargetURL = target
@@ -1046,9 +1092,13 @@ class BrowserViewModel {
             !excludedDomainCache.contains(ExcludedDomain.canonicalize($0.domain))
         }
         guard !queue.isEmpty else {
-            showToast("Vault is empty")
+            showToast("Vault is empty", force: true)
             return
         }
+
+        isStartingRCR = true
+        rcrStartGeneration &+= 1
+        let startGeneration = rcrStartGeneration
 
         // Fetch password counts off the main thread so a large vault can't
         // freeze the UI at run start; the rest of the setup continues in
@@ -1060,6 +1110,10 @@ class BrowserViewModel {
             let counts = await Task.detached {
                 credIDs.map { KeychainService.shared.getPasswords(for: $0).count }
             }.value
+            // A stop (or a stale earlier start) during the preflight aborts
+            // this run before it touches anything.
+            guard self.isStartingRCR, self.rcrStartGeneration == startGeneration else { return }
+            self.isStartingRCR = false
             self.beginRCRRun(
                 context: context,
                 credIDs: credIDs,
@@ -1144,10 +1198,16 @@ class BrowserViewModel {
     }
 
     func stopRCR(reason: String? = nil) {
+        // Invalidate any in-flight start preflight and per-attempt watchdog.
+        isStartingRCR = false
+        rcrStartGeneration &+= 1
+        cancelRCRWatchdog()
         isRCRRunning = false
         rcrStatus = .idle
         rcrAwaitingNavigation = false
         rcrTargetURL = nil
+        // Don't leave plaintext passwords sitting in memory after a stop.
+        rcrCurrentPasswords = []
         activeTab?.webView?.evaluateJavaScript(
             JavaScriptInjectionService.rcrUninstallObserverScript(),
             completionHandler: nil
@@ -1262,23 +1322,50 @@ class BrowserViewModel {
         }
 
         let liveURL = activeTab?.webView?.url ?? activeTab?.url
-        if !sameTarget(liveURL, rcrTargetURL), let target = rcrTargetURL {
+        if !Self.sameTarget(liveURL, rcrTargetURL), let target = rcrTargetURL {
             rcrStatus = .navigating
             rcrAwaitingNavigation = true
             activeTab?.url = target
             activeTab?.lastURL = target
             activeTab?.webView?.load(URLRequest(url: target))
+            // If this load never finishes (dead page, wedged process), the
+            // watchdog advances the run instead of stalling forever.
+            armRCRWatchdog()
             return
         }
 
         await attemptFill()
     }
 
-    private func sameTarget(_ a: URL?, _ b: URL?) -> Bool {
+    /// Same-origin check used to decide whether the runner needs to
+    /// re-navigate before filling. Includes the query string — login flows
+    /// are often differentiated by `?next=` / return-URL parameters, and
+    /// ignoring them could fill credentials into the wrong page variant.
+    nonisolated static func sameTarget(_ a: URL?, _ b: URL?) -> Bool {
         guard let a, let b else { return false }
         return a.scheme?.lowercased() == b.scheme?.lowercased()
             && a.host(percentEncoded: false)?.lowercased() == b.host(percentEncoded: false)?.lowercased()
             && a.path == b.path
+            && (a.query(percentEncoded: false) ?? "") == (b.query(percentEncoded: false) ?? "")
+    }
+
+    /// Origin gate for `rcrObserver` page messages. The observer runs inside
+    /// the page's JS context, so any page can post forged state (e.g.
+    /// `hasDisabled: true`, which triggers vault auto-deletion). Only trust
+    /// messages from the run's target host — exact match after www-stripping,
+    /// or a subdomain of it (post-login redirects often land on
+    /// `account.`/`my.` subdomains of the target).
+    nonisolated static func isTrustedRCROrigin(_ originHost: String?, targetHost: String?) -> Bool {
+        guard let originHost, let targetHost else { return false }
+        func normalize(_ host: String) -> String {
+            var h = host.lowercased()
+            if h.hasPrefix("www.") { h = String(h.dropFirst(4)) }
+            return h
+        }
+        let origin = normalize(originHost)
+        let target = normalize(targetHost)
+        guard !origin.isEmpty, !target.isEmpty else { return false }
+        return origin == target || origin.hasSuffix("." + target)
     }
 
     private func attemptFill() async {
@@ -1318,6 +1405,10 @@ class BrowserViewModel {
         let rawDelay = UserDefaults.standard.double(forKey: "rcrSubmitDelay")
         let delay = rawDelay > 0 ? rawDelay : 1.5
         if extraCount > 0 {
+            // The extra-submit loop is self-driving (state check after every
+            // submit) and can legitimately run for ~50s — the watchdog must
+            // not fire during it. It re-arms when the loop finishes.
+            cancelRCRWatchdog()
             rcrExtraSubmitsInFlight = true
             for _ in 0..<extraCount {
                 try? await Task.sleep(for: .seconds(delay))
@@ -1361,12 +1452,59 @@ class BrowserViewModel {
         rcrStatus = .waiting
         let installScript = JavaScriptInjectionService.rcrInstallObserverScript()
         _ = try? await activeTab?.webView?.evaluateJavaScript(installScript)
+        armRCRWatchdog()
+    }
+
+    // MARK: - RCR watchdog
+
+    /// Arms the per-attempt watchdog. If the page produces no state message
+    /// within the timeout (navigation failure, dead page, wedged web
+    /// process), the attempt is recorded as failed and the run advances —
+    /// previously the runner sat in "watching" forever.
+    private func armRCRWatchdog() {
+        rcrWatchdogTask?.cancel()
+        rcrWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.rcrWatchdogTimeout)
+            guard let self, !Task.isCancelled else { return }
+            self.rcrWatchdogFired()
+        }
+    }
+
+    private func cancelRCRWatchdog() {
+        rcrWatchdogTask?.cancel()
+        rcrWatchdogTask = nil
+    }
+
+    private func rcrWatchdogFired() {
+        guard isRCRRunning, rcrStatus == .waiting || rcrStatus == .navigating else { return }
+        rcrAwaitingNavigation = false
+        guard let credential = currentRCRCredential() else {
+            rcrIndex += 1
+            Task { await self.runCurrentCredential() }
+            return
+        }
+        let password = rcrCurrentPasswords[safe: rcrPasswordIndex] ?? ""
+        captureAndRecord(credential: credential, password: password, status: .failed)
+        showToast("No response — skipping \(credential.username)")
+        if rcrPasswordIndex + 1 < rcrCurrentPasswords.count {
+            rcrPasswordIndex += 1
+            Task { await self.attemptFill() }
+        } else {
+            persistRCRProgress(completedID: credential.id)
+            rcrCompletedIDs.insert(credential.id)
+            rcrIndex += 1
+            rcrPasswordIndex = 0
+            Task { await self.runCurrentCredential() }
+        }
     }
 
     func rcrPageDidFinish() {
         guard isRCRRunning else { return }
         if rcrAwaitingNavigation {
             rcrAwaitingNavigation = false
+            // Navigation leg completed — the navigation watchdog is no
+            // longer relevant; attemptFill arms the observation watchdog.
+            cancelRCRWatchdog()
             // A cookie/consent popup only ever shows up on a window's first
             // load or right after a burn+reload — both of which land here.
             // Wait for it to appear-and-dismiss (or time out) before filling
@@ -1385,12 +1523,18 @@ class BrowserViewModel {
                 JavaScriptInjectionService.rcrInstallObserverScript(),
                 completionHandler: nil
             )
+            // A reload during observation gets a fresh watchdog window so a
+            // dead reload can't stall the run.
+            armRCRWatchdog()
         }
     }
 
     func handleRCRStateMessage(_ payload: [String: Any]) {
         guard isRCRRunning, rcrStatus == .waiting else { return }
         if rcrExtraSubmitsInFlight { return }
+        // NOTE: the watchdog stays armed on purpose — an actionable payload
+        // advances the run (which re-arms), while a page that mutates
+        // without ever resolving still needs the watchdog to fire.
         let hasPassword = payload["hasPassword"] as? Bool ?? false
         let hasWelcome = payload["hasWelcome"] as? Bool ?? false
         let hasDisabled = payload["hasDisabled"] as? Bool ?? false
@@ -1432,8 +1576,11 @@ class BrowserViewModel {
                 password: password,
                 status: .disabled
             )
+            // Capture before deletion — reading a property off a deleted
+            // SwiftData model can fault.
+            let deletedID = credential.id
             deleteCredentialPermanently(credential)
-            Task { await burnAndAdvance(completedID: credential.id) }
+            Task { await burnAndAdvance(completedID: deletedID) }
             return
         }
 
@@ -1512,6 +1659,7 @@ class BrowserViewModel {
             activeTab?.url = target
             activeTab?.lastURL = target
             activeTab?.webView?.load(URLRequest(url: target))
+            armRCRWatchdog()
             return
         }
         await runCurrentCredential()
@@ -1627,19 +1775,29 @@ class BrowserViewModel {
         }
     }
 
-    /// Master gate for in-app notifications. Off by default; user can
-    /// enable from Settings.
+    /// Master gate for in-app notifications. ON by default — the toasts are
+    /// the only feedback channel for guard-rail messages ("Vault is empty",
+    /// "Stop RCR first", …), so hiding them by default made the app look
+    /// dead on a fresh install. The user can still silence status toasts in
+    /// Settings; guard/error toasts pass `force: true` and always show.
     static var notificationsEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "inAppNotifications")
+        UserDefaults.standard.object(forKey: "inAppNotifications") as? Bool ?? true
     }
 
-    func showToast(_ message: String) {
-        guard Self.notificationsEnabled else { return }
+    /// - Parameter force: bypasses the notifications setting. Only for
+    ///   run-blocking guards and errors — status/progress toasts stay gated.
+    func showToast(_ message: String, force: Bool = false) {
+        guard force || Self.notificationsEnabled else { return }
+        // Generation counter: an older toast's hide task must never hide a
+        // newer toast that replaced it mid-display.
+        toastGeneration &+= 1
+        let generation = toastGeneration
         toastMessage = message
         withAnimation(.snappy) { toastVisible = true }
-        Task {
+        Task { [weak self] in
             try? await Task.sleep(for: .seconds(2))
-            withAnimation(.snappy) { toastVisible = false }
+            guard let self, self.toastGeneration == generation else { return }
+            withAnimation(.snappy) { self.toastVisible = false }
         }
     }
 }

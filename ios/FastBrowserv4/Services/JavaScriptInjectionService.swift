@@ -750,11 +750,17 @@ extension JavaScriptInjectionService {
 }
 
 extension String {
+    /// Escapes a Swift string for interpolation into a single-quoted JS
+    /// string literal. U+2028/U+2029 are legal in JSON but are line
+    /// terminators in older ECMAScript string literals — a password
+    /// containing either would silently break the whole injected script.
     var jsEscaped: String {
         self.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "'", with: "\\'")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
+            .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
     }
 }

@@ -19,7 +19,6 @@ class BrowserTab: Identifiable {
     var webView: WKWebView?
     var lastURL: URL?
     var snapshot: UIImage?
-    var isWebViewActive: Bool
 
     init(url: URL? = nil, dataStoreID: UUID = UUID()) {
         self.id = UUID().uuidString
@@ -31,7 +30,6 @@ class BrowserTab: Identifiable {
         self.canGoForward = false
         self.estimatedProgress = 0
         self.lastURL = url
-        self.isWebViewActive = false
     }
 
     var domain: String {

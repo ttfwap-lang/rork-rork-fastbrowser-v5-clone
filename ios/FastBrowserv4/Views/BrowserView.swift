@@ -72,7 +72,11 @@ struct BrowserView: View {
         .task {
             viewModel.setup(modelContext: modelContext)
             await WebViewConfigurationFactory.shared.prepare()
-            DNSPrewarmService.shared.prewarmTopDomains(modelContext: modelContext)
+            // Pre-connecting pings the user's most-visited sites at launch —
+            // opt-in only (Settings → Browser).
+            if UserDefaults.standard.bool(forKey: "dnsPrewarmEnabled") {
+                DNSPrewarmService.shared.prewarmTopDomains(modelContext: modelContext)
+            }
         }
         .sheet(item: $viewModel.presentedSheet, onDismiss: {
             viewModel.reloadExcludedDomains()

@@ -39,8 +39,13 @@ final class QuadController {
     var hostBrowser: BrowserViewModel? { browserViewModel }
     private var modelContext: ModelContext?
 
-    /// Per-session browser targets. Index maps to `session.index`.
-    private var sessionTargetURLs: [URL?] = Array(repeating: nil, count: 12)
+    /// Re-entrancy latch: set synchronously at run start, before the
+    /// off-main keychain preflight completes, so a double-tap can't stack
+    /// two overlapping runs. Cleared when the run begins or is stopped.
+    private(set) var isStartingRCR: Bool = false
+    /// Generation guard: a stop followed by a quick restart invalidates the
+    /// previous preflight task, so its continuation can't start a stale run.
+    private var rcrStartGeneration: Int = 0
     private var dualSiteURLA: URL?
     private var dualSiteURLB: URL?
     private(set) var dualSiteSplitPattern: DualSiteSplitPattern = .checkerboard
@@ -282,7 +287,6 @@ final class QuadController {
 
     private func navigate(_ session: QuadSession, to url: URL) {
         session.url = url
-        sessionTargetURLs[session.index] = url
         guard session.webView?.url != url else { return }
         session.webView?.load(URLRequest(url: url))
     }
@@ -301,9 +305,7 @@ final class QuadController {
             items.append(RCRQueueItem(
                 id: id,
                 username: username,
-                passwordCount: pwCount,
-                isCompleted: false,
-                isCurrent: i == s.rcrIndex
+                passwordCount: pwCount
             ))
         }
         return items
@@ -318,9 +320,7 @@ final class QuadController {
             items.append(RCRQueueItem(
                 id: id,
                 username: username,
-                passwordCount: pwCount,
-                isCompleted: true,
-                isCurrent: false
+                passwordCount: pwCount
             ))
         }
         return items
@@ -329,6 +329,7 @@ final class QuadController {
     // MARK: - Quad RCR (normal 4-way split — unchanged)
 
     func startQuadRCR(targetURL: URL) {
+        guard !anyRCRRunning, !isStartingRCR else { return }
         guard let context = modelContext else { return }
         dualQuadActive = false
         let descriptor = FetchDescriptor<Credential>(
@@ -338,21 +339,37 @@ final class QuadController {
             ]
         )
         guard let all = try? context.fetch(descriptor), !all.isEmpty else {
-            browserViewModel?.showToast("Vault is empty")
+            browserViewModel?.showToast("Vault is empty", force: true)
             return
         }
         let excluded = browserViewModel?.excludedDomainSet ?? []
         let queue = all.filter { !excluded.contains(ExcludedDomain.canonicalize($0.domain)) }
         guard !queue.isEmpty else {
-            browserViewModel?.showToast("Vault is empty")
+            browserViewModel?.showToast("Vault is empty", force: true)
             return
         }
-        // Reset all active session targets to the shared URL and clear disabled.
+        // Reset all active sessions and clear any leftover disabled state.
         for s in activeSessions {
             s.isDisabled = false
-            sessionTargetURLs[s.index] = targetURL
         }
-        partitionAndStart(queue: queue, targetURL: targetURL)
+
+        // Keychain reads block the caller — fetch password counts off the
+        // main thread so a large vault can't freeze the UI at run start.
+        isStartingRCR = true
+        rcrStartGeneration &+= 1
+        let startGeneration = rcrStartGeneration
+        let credIDs = queue.map(\.id)
+        Task { [weak self] in
+            guard let self else { return }
+            let counts = await Task.detached {
+                credIDs.map { KeychainService.shared.getPasswords(for: $0).count }
+            }.value
+            // A stop (or a stale earlier start) during the preflight aborts
+            // this run before it touches anything.
+            guard self.isStartingRCR, self.rcrStartGeneration == startGeneration else { return }
+            self.isStartingRCR = false
+            self.partitionAndStart(queue: queue, targetURL: targetURL, passwordCounts: counts)
+        }
     }
 
     /// Splits the vault evenly across every active window (4/6/8/9/12) using
@@ -361,13 +378,13 @@ final class QuadController {
     /// how small the vault. For repeatability across runs the queue is
     /// sorted the same way every time (domain → username). Disabled windows
     /// (e.g. 3×3 center in dual-site mode) are excluded from the partition.
-    private func partitionAndStart(queue: [Credential], targetURL: URL) {
+    private func partitionAndStart(queue: [Credential], targetURL: URL, passwordCounts: [Int]) {
         guard let context = modelContext else { return }
 
         let participants = enabledSessions
         let count = participants.count
         guard count > 0 else {
-            browserViewModel?.showToast("No active windows")
+            browserViewModel?.showToast("No active windows", force: true)
             return
         }
         var slices: [[Credential]] = Array(repeating: [], count: count)
@@ -377,21 +394,24 @@ final class QuadController {
 
         let domain = targetURL.host(percentEncoded: false)?.lowercased() ?? ""
         let tracker = AttemptTrackingService.shared
+        let countsByID = Dictionary(uniqueKeysWithValues: zip(queue.map(\.id), passwordCounts))
 
         for (sliceIdx, s) in participants.enumerated() {
             let creds = slices[sliceIdx]
             if !creds.isEmpty {
                 let allFinished = creds.allSatisfy { c in
-                    let pwCount = KeychainService.shared.getPasswords(for: c.id).count
-                    return tracker.credentialIsFinished(
-                        context: context, credentialID: c.id, targetDomain: domain, totalPasswords: pwCount
+                    tracker.credentialIsFinished(
+                        context: context,
+                        credentialID: c.id,
+                        targetDomain: domain,
+                        totalPasswords: countsByID[c.id] ?? 0
                     )
                 }
                 if allFinished {
                     tracker.clearAttempts(context: context, credentialIDs: Set(creds.map(\.id)), targetDomain: domain)
                 }
             }
-            startSessionRCR(s, creds: creds, targetURL: targetURL, targetDomain: domain, context: context, tracker: tracker)
+            startSessionRCR(s, creds: creds, targetURL: targetURL, targetDomain: domain, countsByID: countsByID, context: context, tracker: tracker)
         }
     }
 
@@ -400,12 +420,13 @@ final class QuadController {
         creds: [Credential],
         targetURL: URL,
         targetDomain: String,
+        countsByID: [String: Int],
         context: ModelContext,
         tracker: AttemptTrackingService
     ) {
         let credIDs = creds.map(\.id)
         let usernames = creds.map(\.username)
-        let counts: [Int] = credIDs.map { id in KeychainService.shared.getPasswords(for: id).count }
+        let counts: [Int] = credIDs.map { countsByID[$0] ?? 0 }
 
         s.rcrQueueIDs = credIDs
         s.rcrQueueUsernames = usernames
@@ -418,8 +439,6 @@ final class QuadController {
         s.rcrTargetURL = targetURL
         s.rcrCurrentDomain = targetDomain
         s.rcrAwaitingNavigation = false
-
-        sessionTargetURLs[s.index] = targetURL
 
         while s.rcrIndex < s.rcrTotal {
             let id = s.rcrQueueIDs[s.rcrIndex]
@@ -453,6 +472,9 @@ final class QuadController {
     }
 
     func stopQuadRCR(reason: String? = nil) {
+        // Invalidate any in-flight start preflight.
+        isStartingRCR = false
+        rcrStartGeneration &+= 1
         for s in enabledSessions where s.rcrRunning {
             s.rcrRunning = false
             s.rcrStatus = .idle
@@ -464,6 +486,10 @@ final class QuadController {
             )
         }
         for s in activeSessions {
+            s.rcrWatchdog?.cancel()
+            s.rcrWatchdog = nil
+            // Don't leave plaintext passwords sitting in memory after a stop.
+            s.rcrPasswords = []
             s.webView?.evaluateJavaScript(
                 JavaScriptInjectionService.rcrScrollDisableScript(),
                 completionHandler: nil
@@ -500,6 +526,9 @@ final class QuadController {
         guard s.rcrIndex < s.rcrQueueIDs.count else {
             s.rcrRunning = false
             s.rcrStatus = .finished
+            cancelRCRWatchdog(for: s)
+            // Don't leave plaintext passwords sitting in memory.
+            s.rcrPasswords = []
             checkAllFinished()
             return
         }
@@ -569,22 +598,81 @@ final class QuadController {
         }
 
         let liveURL = s.webView?.url ?? s.url
-        if !sameTarget(liveURL, s.rcrTargetURL), let target = s.rcrTargetURL {
+        if !BrowserViewModel.sameTarget(liveURL, s.rcrTargetURL), let target = s.rcrTargetURL {
             s.rcrStatus = .navigating
             s.rcrAwaitingNavigation = true
             s.url = target
             s.webView?.load(URLRequest(url: target))
+            // If this load never finishes (dead page, wedged process), the
+            // watchdog advances the run instead of stalling forever.
+            armRCRWatchdog(for: s)
             return
         }
 
         await attemptFill(session: s)
     }
 
-    private func sameTarget(_ a: URL?, _ b: URL?) -> Bool {
-        guard let a, let b else { return false }
-        return a.scheme?.lowercased() == b.scheme?.lowercased()
-            && a.host(percentEncoded: false)?.lowercased() == b.host(percentEncoded: false)?.lowercased()
-            && a.path == b.path
+    // MARK: - Per-attempt watchdog
+
+    private static let rcrWatchdogTimeout: Duration = .seconds(12)
+
+    /// Arms the per-attempt watchdog. If the page produces no state message
+    /// within the timeout (navigation failure, dead page, wedged web
+    /// process), the attempt is recorded as failed and the run advances —
+    /// previously the session sat in "watching" forever.
+    private func armRCRWatchdog(for s: QuadSession) {
+        s.rcrWatchdog?.cancel()
+        s.rcrWatchdog = Task { [weak self, weak s] in
+            try? await Task.sleep(for: Self.rcrWatchdogTimeout)
+            guard let self, let s, !Task.isCancelled else { return }
+            self.rcrWatchdogFired(session: s)
+        }
+    }
+
+    private func cancelRCRWatchdog(for s: QuadSession) {
+        s.rcrWatchdog?.cancel()
+        s.rcrWatchdog = nil
+    }
+
+    private func rcrWatchdogFired(session s: QuadSession) {
+        guard s.rcrRunning, s.rcrStatus == .waiting || s.rcrStatus == .navigating else { return }
+        s.rcrAwaitingNavigation = false
+
+        if dualQuadActive {
+            // Mirror the normal failed-password flow so lanes stay paired.
+            let lane = laneIndex(for: s)
+            guard let credential = currentDualCredential(s) else {
+                finishDualSide(session: s, lane: lane, status: .failed)
+                return
+            }
+            let password = s.rcrPasswords[safe: s.rcrPasswordIndex] ?? ""
+            captureAndRecord(session: s, credential: credential, password: password, status: .failed)
+            if s.rcrPasswordIndex + 1 < s.rcrPasswords.count {
+                s.rcrPasswordIndex += 1
+                Task { await self.attemptFillDual(session: s, lane: lane) }
+            } else {
+                finishDualSide(session: s, lane: lane, status: .failed)
+            }
+            return
+        }
+
+        guard let credential = currentCredential(s) else {
+            s.rcrIndex += 1
+            Task { await self.runCurrent(session: s) }
+            return
+        }
+        let password = s.rcrPasswords[safe: s.rcrPasswordIndex] ?? ""
+        captureAndRecord(session: s, credential: credential, password: password, status: .failed)
+        browserViewModel?.showToast("No response — skipping \(credential.username)")
+        if s.rcrPasswordIndex + 1 < s.rcrPasswords.count {
+            s.rcrPasswordIndex += 1
+            Task { await self.attemptFill(session: s) }
+        } else {
+            s.rcrCompletedIDs.insert(credential.id)
+            s.rcrIndex += 1
+            s.rcrPasswordIndex = 0
+            Task { await self.runCurrent(session: s) }
+        }
     }
 
     private func attemptFill(session s: QuadSession) async {
@@ -621,6 +709,10 @@ final class QuadController {
         let rawDelay = UserDefaults.standard.double(forKey: "rcrSubmitDelay")
         let delay = rawDelay > 0 ? rawDelay : 1.5
         if extraCount > 0 {
+            // The extra-submit loop is self-driving (state check after every
+            // submit) and can legitimately run for ~50s — the watchdog must
+            // not fire during it. It re-arms when the loop finishes.
+            cancelRCRWatchdog(for: s)
             s.rcrExtraSubmitsInFlight = true
             for _ in 0..<extraCount {
                 try? await Task.sleep(for: .seconds(delay))
@@ -665,6 +757,7 @@ final class QuadController {
         s.rcrStatus = .waiting
         let installScript = JavaScriptInjectionService.rcrInstallObserverScript()
         _ = try? await s.webView?.evaluateJavaScript(installScript)
+        armRCRWatchdog(for: s)
     }
 
     /// Entry point for the WKScriptMessageHandler — routes to the normal
@@ -676,6 +769,9 @@ final class QuadController {
         }
         guard s.rcrRunning, s.rcrStatus == .waiting else { return }
         if s.rcrExtraSubmitsInFlight { return }
+        // NOTE: the watchdog stays armed on purpose — an actionable payload
+        // advances the run (which re-arms), while a page that mutates
+        // without ever resolving still needs the watchdog to fire.
         let hasPassword = payload["hasPassword"] as? Bool ?? false
         let hasWelcome = payload["hasWelcome"] as? Bool ?? false
         let hasDisabled = payload["hasDisabled"] as? Bool ?? false
@@ -705,8 +801,11 @@ final class QuadController {
         if hasDisabled {
             PermaDisabledStore.shared.markDisabled(credentialID: credential.id)
             captureAndRecord(session: s, credential: credential, password: password, status: .disabled)
+            // Capture before deletion — reading a property off a deleted
+            // SwiftData model can fault.
+            let deletedID = credential.id
             deleteCredentialPermanently(credential)
-            Task { await self.burnAndAdvance(session: s, completedID: credential.id) }
+            Task { await self.burnAndAdvance(session: s, completedID: deletedID) }
             return
         }
 
@@ -751,6 +850,7 @@ final class QuadController {
             s.rcrAwaitingNavigation = true
             s.url = target
             s.webView?.load(URLRequest(url: target))
+            armRCRWatchdog(for: s)
             return
         }
         await runCurrent(session: s)
@@ -760,6 +860,9 @@ final class QuadController {
         guard s.rcrRunning else { return }
         if s.rcrAwaitingNavigation {
             s.rcrAwaitingNavigation = false
+            // Navigation leg completed — attemptFill arms the observation
+            // watchdog once the submit is out.
+            cancelRCRWatchdog(for: s)
             // Cookie popups only ever appear on a window's first load or
             // right after a burn+reload — both land here. Wait for it to
             // appear-and-dismiss (or time out) before filling the next login.
@@ -779,6 +882,9 @@ final class QuadController {
                 JavaScriptInjectionService.rcrInstallObserverScript(),
                 completionHandler: nil
             )
+            // A reload during observation gets a fresh watchdog window so a
+            // dead reload can't stall the run.
+            armRCRWatchdog(for: s)
         }
     }
 
@@ -1008,6 +1114,7 @@ final class QuadController {
     /// Dual-quad RCR: two lanes, each testing one credential against BOTH
     /// URL A and URL B before advancing to the next vault entry.
     func startDualQuadRCR(urlA: URL, urlB: URL) {
+        guard !anyRCRRunning, !isStartingRCR else { return }
         guard let context = modelContext else { return }
         let descriptor = FetchDescriptor<Credential>(
             sortBy: [
@@ -1016,23 +1123,60 @@ final class QuadController {
             ]
         )
         guard let all = try? context.fetch(descriptor), !all.isEmpty else {
-            browserViewModel?.showToast("Vault is empty")
+            browserViewModel?.showToast("Vault is empty", force: true)
             return
         }
         let excluded = browserViewModel?.excludedDomainSet ?? []
+
+        let eligible = all.filter { cred in
+            !excluded.contains(ExcludedDomain.canonicalize(cred.domain))
+                && !PermaDisabledStore.shared.isDisabled(credentialID: cred.id)
+        }
+        guard !eligible.isEmpty else {
+            browserViewModel?.showToast("Vault is empty", force: true)
+            return
+        }
+
+        let lanes = laneSessionAIndices.count
+        guard lanes > 0 else {
+            browserViewModel?.showToast("No valid lane pairing for this layout", force: true)
+            return
+        }
+
+        // Keychain reads block the caller — fetch password counts off the
+        // main thread so a large vault can't freeze the UI at run start.
+        isStartingRCR = true
+        rcrStartGeneration &+= 1
+        let startGeneration = rcrStartGeneration
+        let credIDs = eligible.map(\.id)
+        Task { [weak self] in
+            guard let self else { return }
+            let counts = await Task.detached {
+                Dictionary(uniqueKeysWithValues: credIDs.map {
+                    ($0, KeychainService.shared.getPasswords(for: $0).count)
+                })
+            }.value
+            guard self.isStartingRCR, self.rcrStartGeneration == startGeneration else { return }
+            self.isStartingRCR = false
+            self.beginDualQuadRun(urlA: urlA, urlB: urlB, eligible: eligible, passwordCounts: counts, context: context)
+        }
+    }
+
+    /// Continues `startDualQuadRCR` on the main actor once password counts
+    /// are ready: applies the restart/resume rules and kicks off every lane.
+    private func beginDualQuadRun(
+        urlA: URL,
+        urlB: URL,
+        eligible: [Credential],
+        passwordCounts: [String: Int],
+        context: ModelContext
+    ) {
         let domainA = urlA.host(percentEncoded: false)?.lowercased() ?? ""
         let domainB = urlB.host(percentEncoded: false)?.lowercased() ?? ""
         let tracker = AttemptTrackingService.shared
 
-        func eligiblePool() -> [Credential] {
-            all.filter { cred in
-                !excluded.contains(ExcludedDomain.canonicalize(cred.domain))
-                    && !PermaDisabledStore.shared.isDisabled(credentialID: cred.id)
-            }
-        }
-
         func finishedBoth(_ cred: Credential) -> Bool {
-            let pwCount = KeychainService.shared.getPasswords(for: cred.id).count
+            let pwCount = passwordCounts[cred.id] ?? 0
             let doneA = tracker.credentialIsFinished(
                 context: context, credentialID: cred.id, targetDomain: domainA, totalPasswords: pwCount
             )
@@ -1043,17 +1187,6 @@ final class QuadController {
         }
 
         let lanes = laneSessionAIndices.count
-        guard lanes > 0 else {
-            browserViewModel?.showToast("No valid lane pairing for this layout")
-            return
-        }
-
-        let eligible = eligiblePool()
-        guard !eligible.isEmpty else {
-            browserViewModel?.showToast("Vault is empty")
-            return
-        }
-
         let finishedBeforeRestart = eligible.filter { finishedBoth($0) }
         let restartingClean = finishedBeforeRestart.count == eligible.count
         if restartingClean {
@@ -1097,7 +1230,7 @@ final class QuadController {
             let slice = fullLaneSlices[lane]
             let sliceIDs = slice.map(\.id)
             let sliceUsernames = slice.map(\.username)
-            let sliceCounts: [Int] = sliceIDs.map { KeychainService.shared.getPasswords(for: $0).count }
+            let sliceCounts: [Int] = sliceIDs.map { passwordCounts[$0] ?? 0 }
             let skipIDs = laneStates[lane].skipIDs
             for s in [sessionA(forLane: lane), sessionB(forLane: lane)] {
                 s.rcrQueueIDs = sliceIDs
@@ -1148,6 +1281,11 @@ final class QuadController {
             sA.rcrStatus = .finished
             sB.rcrRunning = false
             sB.rcrStatus = .finished
+            cancelRCRWatchdog(for: sA)
+            cancelRCRWatchdog(for: sB)
+            // Don't leave plaintext passwords sitting in memory.
+            sA.rcrPasswords = []
+            sB.rcrPasswords = []
             checkDualQuadAllFinished()
             return
         }
@@ -1261,15 +1399,17 @@ final class QuadController {
             s.rcrAwaitingNavigation = true
             s.url = targetURL
             s.webView?.load(URLRequest(url: targetURL))
+            armRCRWatchdog(for: s)
             return
         }
 
         let liveURL = s.webView?.url ?? s.url
-        if !sameTarget(liveURL, targetURL) {
+        if !BrowserViewModel.sameTarget(liveURL, targetURL) {
             s.rcrStatus = .navigating
             s.rcrAwaitingNavigation = true
             s.url = targetURL
             s.webView?.load(URLRequest(url: targetURL))
+            armRCRWatchdog(for: s)
             return
         }
 
@@ -1306,6 +1446,9 @@ final class QuadController {
         let rawDelay = UserDefaults.standard.double(forKey: "rcrSubmitDelay")
         let delay = rawDelay > 0 ? rawDelay : 1.5
         if extraCount > 0 {
+            // Self-driving loop — watchdog must not fire during it; it
+            // re-arms when the loop hands back to the observer.
+            cancelRCRWatchdog(for: s)
             s.rcrExtraSubmitsInFlight = true
             for _ in 0..<extraCount {
                 try? await Task.sleep(for: .seconds(delay))
@@ -1349,11 +1492,13 @@ final class QuadController {
         s.rcrStatus = .waiting
         let installScript = JavaScriptInjectionService.rcrInstallObserverScript()
         _ = try? await s.webView?.evaluateJavaScript(installScript)
+        armRCRWatchdog(for: s)
     }
 
     private func handleDualQuadMessage(session s: QuadSession, payload: [String: Any]) {
         guard dualQuadActive, s.rcrRunning, s.rcrStatus == .waiting else { return }
         if s.rcrExtraSubmitsInFlight { return }
+        // NOTE: watchdog stays armed — see handleRCRMessage.
         let lane = laneIndex(for: s)
         guard let credential = currentDualCredential(s) else {
             finishDualSide(session: s, lane: lane, status: .failed)
@@ -1445,8 +1590,11 @@ final class QuadController {
 
         if isRemovalSafe {
             PermaDisabledStore.shared.markDisabled(credentialID: credential.id)
+            // Capture before deletion — reading a property off a deleted
+            // SwiftData model can fault.
+            let deletedUsername = credential.username
             deleteCredentialPermanently(credential)
-            browserViewModel?.showToast("Removed (disabled) — \(credential.username)")
+            browserViewModel?.showToast("Removed (disabled) — \(deletedUsername)")
         }
 
         for s in [sessionA(forLane: lane), sessionB(forLane: lane)] {

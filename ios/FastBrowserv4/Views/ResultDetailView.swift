@@ -3,13 +3,13 @@ import SwiftUI
 struct ResultDetailView: View {
     let record: AttemptRecord
     @Environment(\.dismiss) private var dismiss
+    @State private var screenshot: UIImage?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                if let filename = record.screenshotFilename,
-                   let image = ScreenshotStorage.loadImage(filename) {
-                    Image(uiImage: image)
+                if let screenshot {
+                    Image(uiImage: screenshot)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .clipShape(.rect(cornerRadius: 12))
@@ -50,6 +50,11 @@ struct ResultDetailView: View {
         }
         .navigationTitle("Attempt")
         .navigationBarTitleDisplayMode(.inline)
+        // Decode off the main thread instead of synchronously in body.
+        .task(id: record.screenshotFilename) {
+            guard let filename = record.screenshotFilename else { return }
+            screenshot = await ScreenshotStorage.loadImageAsync(filename)
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Done") { dismiss() }

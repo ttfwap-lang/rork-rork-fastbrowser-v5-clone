@@ -5,15 +5,24 @@ struct ContentView: View {
     @State private var biometricService = BiometricService()
 
     var body: some View {
-        Group {
-            if biometricService.isUnlocked {
-                BrowserView()
-            } else {
+        // BrowserView stays in the hierarchy at all times so locking never
+        // destroys its @State (tabs, web views, in-flight RCR runs). When
+        // locked, an opaque cover blocks interaction and visibility instead.
+        ZStack {
+            BrowserView()
+
+            if !biometricService.isUnlocked {
                 LockScreenView(biometricService: biometricService)
+                    .transition(.opacity)
+                    .zIndex(1)
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: biometricService.isUnlocked)
         .onChange(of: scenePhase) { _, newPhase in
-            if newPhase != .active {
+            // Lock only on a real background transition. `.inactive` fires
+            // for Control Center / notification peeks and must not nuke
+            // the session.
+            if newPhase == .background {
                 biometricService.lock()
             }
         }

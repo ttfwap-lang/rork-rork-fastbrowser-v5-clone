@@ -1,8 +1,10 @@
 import UIKit
 import WebKit
+import os
 
 @MainActor
 final class WebViewConfigurationFactory {
+    private static let log = Logger(subsystem: "com.fastfill.browser", category: "WebViewConfiguration")
     static let shared = WebViewConfigurationFactory()
     
     private(set) var contentRuleList: WKContentRuleList?
@@ -143,6 +145,10 @@ final class WebViewConfigurationFactory {
                 forIdentifier: "FastFillBlocker",
                 encodedContentRuleList: rules
             )
-        } catch {}
+        } catch {
+            // A broken rule set must be diagnosable — silent failure means
+            // all tracking protection silently disappears.
+            Self.log.error("Content rule compilation failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 }

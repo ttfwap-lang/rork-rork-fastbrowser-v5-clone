@@ -5,7 +5,8 @@ struct AppSettingsView: View {
     @AppStorage("autoFillOnPageLoad") private var autoFillOnLoad: Bool = true
     @AppStorage("offerToSavePasswords") private var offerToSave: Bool = true
     @AppStorage("defaultSearchEngine") private var searchEngine: String = "Google"
-    @AppStorage("inAppNotifications") private var inAppNotifications: Bool = false
+    @AppStorage("inAppNotifications") private var inAppNotifications: Bool = true
+    @AppStorage("dnsPrewarmEnabled") private var dnsPrewarmEnabled: Bool = false
     @AppStorage("rcrExtraSubmits") private var rcrExtraSubmits: Int = 0
     @AppStorage("rcrSubmitDelay") private var rcrSubmitDelay: Double = 1.5
     @AppStorage("dualQuadURL_A") private var dualQuadURL_A: String = "https://www.ignitioncasino.ooo/login"
@@ -30,7 +31,7 @@ struct AppSettingsView: View {
             } header: {
                 Text("Notifications")
             } footer: {
-                Text("When off, the app suppresses every on-screen toast and banner. The RCR queue pill is unaffected.")
+                Text("When off, status toasts are hidden. Important warnings and errors still appear.")
             }
 
             Section {
@@ -100,17 +101,22 @@ struct AppSettingsView: View {
                 Text("Dual-site mode is available for every grid size. Horizontal, vertical, and checkerboard layouts always assign half the tiles to each URL. The 3×3 grid leaves its center tile unused, splitting the remaining eight tiles evenly.")
             }
 
-            Section("Browser") {
+            Section {
                 Picker("Search Engine", selection: $searchEngine) {
                     Text("Google").tag("Google")
                     Text("DuckDuckGo").tag("DuckDuckGo")
                     Text("Bing").tag("Bing")
                 }
+                Toggle("Pre-connect to Frequent Sites", isOn: $dnsPrewarmEnabled)
+            } header: {
+                Text("Browser")
+            } footer: {
+                Text("Pre-connecting opens a network connection to your most-visited sites at launch so they load faster. Off by default.")
             }
 
             Section("About") {
-                LabeledContent("Version", value: "1.0.0")
-                LabeledContent("Build", value: "1")
+                LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")
+                LabeledContent("Build", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—")
 
                 HStack {
                     Image(systemName: "bolt.shield.fill")

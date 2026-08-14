@@ -247,13 +247,13 @@ private struct ResultRow: View {
 private struct ScreenshotThumbnail: View {
     let record: AttemptRecord
     var size: CGFloat = 110
+    @State private var image: UIImage?
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color(.tertiarySystemFill))
-            if let filename = record.screenshotFilename,
-               let image = ScreenshotStorage.loadImage(filename) {
+            if let image {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
@@ -272,6 +272,12 @@ private struct ScreenshotThumbnail: View {
                 .frame(width: 10, height: 10)
                 .overlay(Circle().stroke(.white, lineWidth: 1.5))
                 .padding(4)
+        }
+        // Decode off the main thread — previously every row decoded its
+        // full JPEG synchronously in body, hitching grid/list scrolling.
+        .task(id: record.screenshotFilename) {
+            guard let filename = record.screenshotFilename else { return }
+            image = await ScreenshotStorage.loadImageAsync(filename)
         }
     }
 }

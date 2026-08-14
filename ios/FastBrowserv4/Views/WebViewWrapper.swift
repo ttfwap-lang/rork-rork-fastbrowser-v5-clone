@@ -17,10 +17,11 @@ struct WebViewWrapper: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         context.coordinator.observeProgress(of: webView)
         webView.allowsBackForwardNavigationGestures = true
+        #if DEBUG
         webView.isInspectable = true
+        #endif
 
         tab.webView = webView
-        tab.isWebViewActive = true
         if let url = tab.url {
             webView.load(URLRequest(url: url))
         }
@@ -97,7 +98,7 @@ struct WebViewWrapper: UIViewRepresentable {
                 viewModel?.updateURLBar()
 
                 if let url = webView.url?.absoluteString {
-                    viewModel?.addHistoryEntry(url: url, title: tab.title)
+                    viewModel?.addHistoryEntry(url: url, title: tab.title, tabID: tab.id)
                 }
 
                 if viewModel?.isRCRRunning == true {
@@ -138,9 +139,21 @@ struct WebViewWrapper: UIViewRepresentable {
         ) {
             let name = message.name
             let body = message.body as? [String: Any] ?? [:]
+            // Capture the sender's origin on this thread — WKScriptMessage
+            // isn't safe to pass across actor hops.
+            let originHost = message.frameInfo.securityOrigin.host
             Task { @MainActor in
                 switch name {
                 case "rcrObserver":
+                    // Origin gate: the observer script lives in the page's JS
+                    // context, so any page (or injected third-party script)
+                    // could post forged state — e.g. hasDisabled:true, which
+                    // triggers vault auto-deletion. Only messages from the
+                    // run's target host are honored.
+                    guard BrowserViewModel.isTrustedRCROrigin(
+                        originHost,
+                        targetHost: viewModel?.rcrTargetURL?.host(percentEncoded: false)
+                    ) else { return }
                     viewModel?.handleRCRStateMessage(body)
                 case "loginResponse":
                     viewModel?.handleLoginResponseMessage(body)

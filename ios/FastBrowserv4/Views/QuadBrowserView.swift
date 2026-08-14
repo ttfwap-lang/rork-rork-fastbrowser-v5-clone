@@ -15,7 +15,9 @@ struct QuadCellWebView: UIViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
+        #if DEBUG
         webView.isInspectable = true
+        #endif
         // KVO for live estimatedProgress so the per-cell progress bar
         // tracks the actual load progression instead of staying at 0.
         webView.addObserver(context.coordinator, forKeyPath: #keyPath(WKWebView.estimatedProgress), options: .new, context: nil)
@@ -29,11 +31,20 @@ struct QuadCellWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        if session.webView !== webView {
-            context.coordinator.ownedWebView?.configuration.userContentController.removeAllScriptMessageHandlers()
-            session.webView = webView
-            context.coordinator.ownedWebView = webView
+        guard session.webView !== webView else { return }
+        // Full teardown/re-wire of the previous view: just stripping script
+        // handlers leaves the KVO observer registered on the old web view
+        // (crash on dealloc) and the new view without its rcrObserver.
+        if let old = context.coordinator.ownedWebView, old !== webView {
+            old.removeObserver(context.coordinator, forKeyPath: #keyPath(WKWebView.estimatedProgress), context: nil)
+            old.configuration.userContentController.removeAllScriptMessageHandlers()
+            old.navigationDelegate = nil
         }
+        webView.addObserver(context.coordinator, forKeyPath: #keyPath(WKWebView.estimatedProgress), options: .new, context: nil)
+        webView.configuration.userContentController.add(context.coordinator, name: "rcrObserver")
+        webView.navigationDelegate = context.coordinator
+        context.coordinator.ownedWebView = webView
+        session.webView = webView
     }
 
     static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
@@ -156,7 +167,17 @@ struct QuadCellWebView: UIViewRepresentable {
         ) {
             guard message.name == "rcrObserver" else { return }
             let body = message.body as? [String: Any] ?? [:]
+            // Capture the sender's origin on this thread — WKScriptMessage
+            // isn't safe to pass across actor hops.
+            let originHost = message.frameInfo.securityOrigin.host
             Task { @MainActor in
+                // Origin gate: only the run's target host may drive RCR
+                // state — a forged `hasDisabled` post from any other origin
+                // would otherwise trigger vault auto-deletion.
+                guard BrowserViewModel.isTrustedRCROrigin(
+                    originHost,
+                    targetHost: session.rcrTargetURL?.host(percentEncoded: false)
+                ) else { return }
                 controller?.handleRCRMessage(session: session, payload: body)
             }
         }

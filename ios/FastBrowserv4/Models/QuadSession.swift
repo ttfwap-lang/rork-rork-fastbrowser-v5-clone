@@ -59,6 +59,11 @@ final class QuadSession: Identifiable {
     var rcrPasswords: [String] = []
     var rcrPasswordIndex: Int = 0
     var rcrAwaitingNavigation: Bool = false
+    /// Per-attempt watchdog: fires when a navigation or the post-submit
+    /// observation produces no page state within the timeout (dead page,
+    /// failed load, wedged web process) so the run advances instead of
+    /// stalling in "watching" forever.
+    var rcrWatchdog: Task<Void, Never>?
     /// True while the runner is performing the configured extra submits.
     /// All other RCR actions are paused until this clears.
     var rcrExtraSubmitsInFlight: Bool = false
