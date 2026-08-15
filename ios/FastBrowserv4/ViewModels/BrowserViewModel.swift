@@ -1145,9 +1145,8 @@ class BrowserViewModel {
         // for the domain so every credential is eligible again.
         let targetDomain = target.host(percentEncoded: false)?.lowercased() ?? ""
         let tracker = AttemptTrackingService.shared
-        let allFinished = credIDs.allSatisfy { id in
-            let total = counts[credIDs.firstIndex(of: id) ?? 0]
-            return tracker.credentialIsFinished(
+        let allFinished = zip(credIDs, counts).allSatisfy { id, total in
+            tracker.credentialIsFinished(
                 context: context,
                 credentialID: id,
                 targetDomain: targetDomain,
