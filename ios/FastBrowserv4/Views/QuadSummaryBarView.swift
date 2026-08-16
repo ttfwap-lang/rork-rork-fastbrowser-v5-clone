@@ -55,12 +55,7 @@ struct QuadSummaryBarView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 18))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18)
-                .strokeBorder(.white.opacity(0.08), lineWidth: 0.5)
-        )
-        .shadow(color: .black.opacity(0.18), radius: 12, y: 4)
+        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
         .padding(.horizontal, 16)
         .contentShape(Rectangle())
     }

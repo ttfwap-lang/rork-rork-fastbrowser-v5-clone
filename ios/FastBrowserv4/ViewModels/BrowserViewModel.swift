@@ -176,6 +176,7 @@ class BrowserViewModel {
     func setup(modelContext: ModelContext) {
         migrateLegacyBuiltInURLs()
         self.modelContext = modelContext
+        IntelligenceCenter.shared.attach(context: modelContext)
         reloadExcludedDomains()
         if tabs.isEmpty {
             addNewTab()
@@ -1386,7 +1387,23 @@ class BrowserViewModel {
             passwordSelector: siteSetting?.passwordSelector,
             suppressKeyboard: true
         )
-        _ = try? await activeTab?.webView?.evaluateJavaScript(fillScript)
+        let fillResult = try? await activeTab?.webView?.evaluateJavaScript(fillScript)
+
+        // Self-healing (Part 3): if the generic selectors missed a field,
+        // ask the AI to repair them — verified and bounded, never on
+        // captcha/lockout pages.
+        if FillHealerEngine.fillMissed(fillResult),
+           let webView = activeTab?.webView,
+           let context = self.modelContext {
+            _ = await FillHealerEngine.shared.healAndRefill(
+                webView: webView,
+                domain: targetDomain,
+                sessionTag: "single",
+                username: credential.username,
+                password: password,
+                modelContext: context
+            )
+        }
 
         rcrStatus = .submitting
         let submitScript = JavaScriptInjectionService.submitFormScript(
@@ -1747,13 +1764,14 @@ class BrowserViewModel {
                         resultPageTitle: pageTitle,
                         screenshotFilename: filename
                     )
-                    Task.detached {
-                        let result = await ScreenshotOCRService.classify(image)
-                        await MainActor.run {
-                            record.ocrCategory = result.category.rawValue
-                            try? context.save()
-                        }
-                    }
+                    // We must not capture the non-Sendable ModelContext or
+                    // the @Model record inside a detached task (Swift 6
+                    // isolation error). Keep everything here on the main
+                    // actor; `classify` hops off-actor internally for the
+                    // Vision work.
+                    let result = await ScreenshotOCRService.classify(image)
+                    record.ocrCategory = result.category.rawValue
+                    try? context.save()
                 }
             }
         } else {

@@ -150,14 +150,16 @@ struct QuadCellWebView: UIViewRepresentable {
             change: [NSKeyValueChangeKey: Any]?,
             context: UnsafeMutableRawPointer?
         ) {
-            guard keyPath == #keyPath(WKWebView.estimatedProgress),
+            // NOTE: plain string literal — under Swift 6 a #keyPath to the
+            // main-actor-isolated property can't be formed from this
+            // nonisolated KVO entry point.
+            guard keyPath == "estimatedProgress",
                   let webView = object as? WKWebView else {
                 super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
                 return
             }
-            let progress = webView.estimatedProgress
             Task { @MainActor in
-                session.estimatedProgress = progress
+                session.estimatedProgress = webView.estimatedProgress
             }
         }
 

@@ -694,7 +694,22 @@ final class QuadController {
             passwordSelector: siteSetting?.passwordSelector,
             suppressKeyboard: true
         )
-        _ = try? await s.webView?.evaluateJavaScript(fillScript)
+        let fillResult = try? await s.webView?.evaluateJavaScript(fillScript)
+
+        // Self-healing (Part 3): AI repairs stuck selector sets — verified,
+        // bounded, and skipped on captcha/lockout pages.
+        if FillHealerEngine.fillMissed(fillResult),
+           let webView = s.webView,
+           let context = self.modelContext {
+            _ = await FillHealerEngine.shared.healAndRefill(
+                webView: webView,
+                domain: targetDomain,
+                sessionTag: s.sessionTag,
+                username: credential.username,
+                password: password,
+                modelContext: context
+            )
+        }
 
         s.rcrStatus = .submitting
         let submitScript = JavaScriptInjectionService.submitFormScript(
@@ -970,13 +985,14 @@ final class QuadController {
                         resultPageTitle: pageTitle,
                         screenshotFilename: filename
                     )
-                    Task.detached {
-                        let result = await ScreenshotOCRService.classify(image)
-                        await MainActor.run {
-                            record.ocrCategory = result.category.rawValue
-                            try? context.save()
-                        }
-                    }
+                    // We must not capture the non-Sendable ModelContext or
+                    // the @Model record inside a detached task (Swift 6
+                    // isolation error). Keep everything here on the main
+                    // actor; `classify` hops off-actor internally for the
+                    // Vision work.
+                    let result = await ScreenshotOCRService.classify(image)
+                    record.ocrCategory = result.category.rawValue
+                    try? context.save()
                 }
             }
         } else {
@@ -1434,7 +1450,20 @@ final class QuadController {
             passwordSelector: siteSetting?.passwordSelector,
             suppressKeyboard: true
         )
-        _ = try? await s.webView?.evaluateJavaScript(fillScript)
+        let fillResult = try? await s.webView?.evaluateJavaScript(fillScript)
+
+        if FillHealerEngine.fillMissed(fillResult),
+           let webView = s.webView,
+           let context = self.modelContext {
+            _ = await FillHealerEngine.shared.healAndRefill(
+                webView: webView,
+                domain: targetDomain,
+                sessionTag: s.sessionTag,
+                username: credential.username,
+                password: password,
+                modelContext: context
+            )
+        }
 
         s.rcrStatus = .submitting
         let submitScript = JavaScriptInjectionService.submitFormScript(

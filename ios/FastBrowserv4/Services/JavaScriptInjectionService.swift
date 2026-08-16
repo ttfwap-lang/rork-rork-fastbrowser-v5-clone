@@ -184,6 +184,140 @@ struct JavaScriptInjectionService {
         """
     }
 
+    /// Structure-only page outline for the AI fill healer. Returns DOM
+    /// metadata (types, names, ids, labels, visibility) — NEVER field values
+    /// or any credential content. This is the only payload an AI ever sees.
+    static func pageOutlineScript() -> String {
+        return """
+        (function() {
+            try {
+                var isVisible = window.__ffb_isVisible || function(el) { return !!el; };
+                var inputs = [];
+                var allInputs = document.querySelectorAll('input, textarea');
+                for (var i = 0; i < allInputs.length && inputs.length < 12; i++) {
+                    var el = allInputs[i];
+                    var visible = false;
+                    try { visible = !!isVisible(el); } catch (e) {}
+                    var labelText = '';
+                    try {
+                        if (el.id) {
+                            var lbl = document.querySelector('label[for="' + el.id + '"]');
+                            if (lbl) labelText = (lbl.textContent || '').trim().slice(0, 60);
+                        }
+                        if (!labelText && el.closest) {
+                            var wrap = el.closest('label');
+                            if (wrap) labelText = (wrap.textContent || '').trim().slice(0, 60);
+                        }
+                    } catch (e) {}
+                    inputs.push({
+                        index: i,
+                        tag: (el.tagName || '').toLowerCase(),
+                        type: (el.getAttribute('type') || 'text').toLowerCase(),
+                        name: el.getAttribute('name') || '',
+                        id: el.id || '',
+                        placeholder: el.getAttribute('placeholder') || '',
+                        ariaLabel: el.getAttribute('aria-label') || '',
+                        autocomplete: el.getAttribute('autocomplete') || '',
+                        labelText: labelText,
+                        visible: visible
+                    });
+                }
+                var buttons = [];
+                var allBtns = document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
+                for (var b = 0; b < allBtns.length && buttons.length < 10; b++) {
+                    var btn = allBtns[b];
+                    var bVisible = false;
+                    try { bVisible = !!isVisible(btn); } catch (e) {}
+                    var text = ((btn.textContent || btn.value || '') + '').trim().slice(0, 40);
+                    buttons.push({
+                        index: b,
+                        tag: (btn.tagName || '').toLowerCase(),
+                        type: (btn.getAttribute('type') || '').toLowerCase(),
+                        id: btn.id || '',
+                        text: text,
+                        visible: bVisible
+                    });
+                }
+                var bodyText = '';
+                try { bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase().slice(0, 3000); } catch (e) {}
+                var captcha = /captcha|are you a robot|verify you'?re human|verify you are human|not a robot/.test(bodyText);
+                var lockout = /account (is )?(locked|disabled|suspended)|too many (failed )?attempts|temporarily blocked/.test(bodyText);
+                return JSON.stringify({
+                    url: location.href,
+                    title: (document.title || '').slice(0, 80),
+                    forms: (document.forms ? document.forms.length : 0),
+                    inputs: inputs,
+                    buttons: buttons,
+                    hasCaptcha: captcha,
+                    hasLockout: lockout
+                });
+            } catch (e) {
+                return JSON.stringify({ url: '', title: '', forms: 0, inputs: [], buttons: [], hasCaptcha: false, hasLockout: false });
+            }
+        })();
+        """
+    }
+
+    /// Probes suggested CSS selectors on the live page and reports what each
+    /// resolves to (tag/type/name/visibility). Used to verify a healed
+    /// selector BEFORE any secret is filled into it.
+    static func selectorProbeScript(
+        usernameSelector: String?,
+        passwordSelector: String?,
+        submitSelector: String?
+    ) -> String {
+        let user = (usernameSelector?.isEmpty == false) ? usernameSelector!.jsEscaped : ""
+        let pass = (passwordSelector?.isEmpty == false) ? passwordSelector!.jsEscaped : ""
+        let submit = (submitSelector?.isEmpty == false) ? submitSelector!.jsEscaped : ""
+        return """
+        (function() {
+            var probe = function(sel) {
+                if (!sel) return { found: false };
+                try {
+                    var el = document.querySelector(sel);
+                    if (!el) return { found: false };
+                    var visible = false;
+                    try { visible = window.__ffb_isVisible ? !!window.__ffb_isVisible(el) : true; } catch (e) {}
+                    return {
+                        found: true,
+                        tag: (el.tagName || '').toLowerCase(),
+                        type: (el.getAttribute('type') || '').toLowerCase(),
+                        name: el.getAttribute('name') || '',
+                        id: el.id || '',
+                        placeholder: el.getAttribute('placeholder') || '',
+                        visible: visible
+                    };
+                } catch (e) { return { found: false }; }
+            };
+            return JSON.stringify({
+                user: probe('\(user)'),
+                pass: probe('\(pass)'),
+                submit: probe('\(submit)')
+            });
+        })();
+        """
+    }
+
+    /// Boolean verification that the current effective selectors found fields
+    /// and that those fields contain values. Returns only booleans — never
+    /// the values themselves.
+    static func verifyFillScript(usernameSelector: String?, passwordSelector: String?) -> String {
+        let user = (usernameSelector?.isEmpty == false) ? usernameSelector!.jsEscaped : ""
+        let pass = (passwordSelector?.isEmpty == false) ? passwordSelector!.jsEscaped : ""
+        return """
+        (function() {
+            var userField = window.__ffb_findUsername ? window.__ffb_findUsername('\(user)') : null;
+            var passField = window.__ffb_findPassword ? window.__ffb_findPassword('\(pass)') : null;
+            return JSON.stringify({
+                userFound: !!userField,
+                passFound: !!passField,
+                userFilled: !!(userField && (userField.value || '').length > 0),
+                passFilled: !!(passField && (passField.value || '').length > 0)
+            });
+        })();
+        """
+    }
+
     /// Installs a one-shot login-response observer that watches the page for
     /// ~6 seconds after a submit and posts a single classification
     /// (`success`, `failed`, `blocked`, or `timeout`) to the

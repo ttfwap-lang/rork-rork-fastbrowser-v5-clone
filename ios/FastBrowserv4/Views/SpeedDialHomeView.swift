@@ -144,15 +144,12 @@ private struct SpeedDialTile: View {
     }
 
     private var badge: some View {
-        RoundedRectangle(cornerRadius: 18, style: .continuous)
-            .fill(Color(.secondarySystemBackground))
+        monogram
             .frame(width: 64, height: 64)
-            .overlay { monogram }
-            .overlay(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(accent.opacity(0.25), lineWidth: 1)
+            .glassEffect(
+                .regular.tint(accent.opacity(0.3)).interactive(),
+                in: .rect(cornerRadius: 18, style: .continuous)
             )
-            .shadow(color: accent.opacity(0.28), radius: 9, y: 5)
     }
 
     private var monogram: some View {

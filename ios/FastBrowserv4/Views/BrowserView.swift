@@ -609,10 +609,7 @@ struct BrowserView: View {
             .foregroundStyle(.cyan)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: .capsule)
-            .overlay(
-                Capsule().strokeBorder(.cyan.opacity(0.35), lineWidth: 0.5)
-            )
+            .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -682,10 +679,7 @@ struct BrowserView: View {
                 .foregroundStyle(.cyan)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 7)
-                .background(.ultraThinMaterial, in: .capsule)
-                .overlay(
-                    Capsule().strokeBorder(.cyan.opacity(0.35), lineWidth: 0.5)
-                )
+                .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
             }
             .buttonStyle(.plain)
             .transition(.opacity.combined(with: .move(edge: .bottom)))

@@ -18,7 +18,7 @@ enum ScreenshotOCRService {
     /// Extracts text from `image` using the on-device Vision framework,
     /// then keyword-matches the result against five categories. Runs
     /// entirely off the main actor so the RCR loop stays responsive.
-    static func classify(_ image: UIImage) async -> (category: Category, allText: String) {
+    nonisolated static func classify(_ image: UIImage) async -> (category: Category, allText: String) {
         guard let cgImage = image.cgImage else {
             return (.unknown, "")
         }
@@ -30,7 +30,7 @@ enum ScreenshotOCRService {
 
     // MARK: - Private
 
-    private static func extractText(cgImage: CGImage) async -> String {
+    nonisolated private static func extractText(cgImage: CGImage) async -> String {
         await withCheckedContinuation { continuation in
             let request = VNRecognizeTextRequest { request, error in
                 guard error == nil,
@@ -59,7 +59,7 @@ enum ScreenshotOCRService {
         }
     }
 
-    private static func categorize(_ text: String) -> Category {
+    nonisolated private static func categorize(_ text: String) -> Category {
         let lower = text.lowercased()
 
         // Order matters — locked and captcha trump failure, which trumps success.

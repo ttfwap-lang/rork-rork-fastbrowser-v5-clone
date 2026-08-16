@@ -13,7 +13,9 @@ struct FastBrowserv4App: App {
             BrowsingHistoryEntry.self,
             Bookmark.self,
             ExcludedDomain.self,
-            AttemptRecord.self
+            AttemptRecord.self,
+            AIProviderConfig.self,
+            AIRepairEvent.self
         ])
     }
 }

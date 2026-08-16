@@ -35,6 +35,19 @@ struct AppSettingsView: View {
             }
 
             Section {
+                NavigationLink {
+                    IntelligenceSettingsView()
+                } label: {
+                    Label("Intelligence", systemImage: "brain.head.profile")
+                        .foregroundStyle(.primary)
+                }
+            } header: {
+                Text("AI Copilot")
+            } footer: {
+                Text("Choose which AI repairs stuck logins and judges success — Apple's on-device model, Apple's private cloud, or your own API keys. Passwords are never shared with any AI.")
+            }
+
+            Section {
                 Stepper(value: $rcrExtraSubmits, in: 0...10) {
                     LabeledContent("Extra Submits", value: "\(rcrExtraSubmits)")
                 }
