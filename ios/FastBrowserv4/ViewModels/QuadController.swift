@@ -4,14 +4,14 @@ import SwiftUI
 import UIKit
 import WebKit
 
-/// Owns up to twelve `QuadSession` objects and orchestrates multi-window
-/// browsing across whichever grid size is currently active (4, 6, 8, 9, or
-/// 12 windows). Sessions beyond `activeCount` sit dormant — no WKWebView is
+/// Owns up to sixteen `QuadSession` objects and orchestrates multi-window
+/// browsing across whichever grid size is currently active (4, 6, 8, 9, 12,
+/// or 16 windows). Sessions beyond `activeCount` sit dormant — no WKWebView is
 /// created for them until their cell is actually rendered.
 @Observable
 @MainActor
 final class QuadController {
-    /// All possible sessions, pre-allocated up to the largest grid (12).
+    /// All possible sessions, pre-allocated up to the largest grid (16).
     let sessions: [QuadSession]
     var focusedIndex: Int = 0
     /// The grid size currently in use. Call `setGridSize(_:)` so dual-site
@@ -52,7 +52,7 @@ final class QuadController {
     private(set) var isDualTargetMode: Bool = false
 
     init() {
-        self.sessions = (0..<12).map { QuadSession(index: $0) }
+        self.sessions = (0..<QuadDataStore.maxSessionCount).map { QuadSession(index: $0) }
     }
 
     func setup(modelContext: ModelContext, browser: BrowserViewModel) {
@@ -372,7 +372,7 @@ final class QuadController {
         }
     }
 
-    /// Splits the vault evenly across every active window (4/6/8/9/12) using
+    /// Splits the vault evenly across every active window (4/6/8/9/12/16) using
     /// balanced round-robin so that every window gets either floor(N/W) or
     /// ceil(N/W) credentials — guaranteed equal to within one, no matter
     /// how small the vault. For repeatability across runs the queue is
@@ -439,6 +439,7 @@ final class QuadController {
         s.rcrTargetURL = targetURL
         s.rcrCurrentDomain = targetDomain
         s.rcrAwaitingNavigation = false
+        s.needsPostBurnSettle = false
 
         while s.rcrIndex < s.rcrTotal {
             let id = s.rcrQueueIDs[s.rcrIndex]
@@ -480,6 +481,7 @@ final class QuadController {
             s.rcrStatus = .idle
             s.rcrAwaitingNavigation = false
             s.rcrExtraSubmitsInFlight = false
+            s.needsPostBurnSettle = false
             s.webView?.evaluateJavaScript(
                 JavaScriptInjectionService.rcrUninstallObserverScript(),
                 completionHandler: nil
@@ -620,10 +622,10 @@ final class QuadController {
     /// within the timeout (navigation failure, dead page, wedged web
     /// process), the attempt is recorded as failed and the run advances —
     /// previously the session sat in "watching" forever.
-    private func armRCRWatchdog(for s: QuadSession) {
+    private func armRCRWatchdog(for s: QuadSession, timeout: Duration = rcrWatchdogTimeout) {
         s.rcrWatchdog?.cancel()
         s.rcrWatchdog = Task { [weak self, weak s] in
-            try? await Task.sleep(for: Self.rcrWatchdogTimeout)
+            try? await Task.sleep(for: timeout)
             guard let self, let s, !Task.isCancelled else { return }
             self.rcrWatchdogFired(session: s)
         }
@@ -860,12 +862,13 @@ final class QuadController {
         s.rcrCompletedIDs.insert(completedID)
         s.rcrIndex += 1
         s.rcrPasswordIndex = 0
+        s.needsPostBurnSettle = true
         if let target = s.rcrTargetURL {
             s.rcrStatus = .navigating
             s.rcrAwaitingNavigation = true
             s.url = target
             s.webView?.load(URLRequest(url: target))
-            armRCRWatchdog(for: s)
+            armRCRWatchdog(for: s, timeout: PageSettleService.postBurnNavigationWatchdog)
             return
         }
         await runCurrent(session: s)
@@ -879,15 +882,11 @@ final class QuadController {
             // watchdog once the submit is out.
             cancelRCRWatchdog(for: s)
             // Cookie popups only ever appear on a window's first load or
-            // right after a burn+reload — both land here. Wait for it to
-            // appear-and-dismiss (or time out) before filling the next login.
+            // right after a burn+reload — both land here. After a perm-
+            // disabled burn the next credential gets extra boot + consent
+            // time so the login form is actually ready before we fill.
             Task {
-                await self.waitForCookieNoticeIfNeeded(session: s)
-                if self.dualQuadActive {
-                    await self.attemptFillDual(session: s, lane: self.laneIndex(for: s))
-                } else {
-                    await self.attemptFill(session: s)
-                }
+                await self.settleThenFill(session: s)
             }
             return
         }
@@ -914,11 +913,38 @@ final class QuadController {
         }
     }
 
-    /// Waits (up to ~10s) for a cookie/consent banner to appear and be
-    /// dismissed. No-op if no banner is present when called.
-    private func waitForCookieNoticeIfNeeded(session s: QuadSession) async {
+    /// After a navigation finishes: wait for cookie/consent (and, after a
+    /// burn, extra page-boot + login-form time) then start the fill.
+    private func settleThenFill(session s: QuadSession) async {
+        let extra = s.needsPostBurnSettle
+        s.needsPostBurnSettle = false
+        await waitForCookieNoticeIfNeeded(session: s, extraBoot: extra)
+        guard s.rcrRunning else { return }
+        if extra, let webView = s.webView {
+            await PageSettleService.waitForLoginForm(in: webView)
+            guard s.rcrRunning else { return }
+        }
+        if dualQuadActive {
+            await attemptFillDual(session: s, lane: laneIndex(for: s))
+        } else {
+            await attemptFill(session: s)
+        }
+    }
+
+    /// Waits for a cookie/consent banner to appear and be dismissed.
+    /// After a burn, gives the page extra time to boot and the CMP extra
+    /// time to inject before concluding there is no banner.
+    private func waitForCookieNoticeIfNeeded(session s: QuadSession, extraBoot: Bool) async {
         guard let webView = s.webView else { return }
-        _ = try? await webView.evaluateJavaScript(JavaScriptInjectionService.waitForCookieNoticeScript())
+        if extraBoot {
+            try? await Task.sleep(for: PageSettleService.postBurnBootDelay)
+            guard s.rcrRunning else { return }
+        }
+        let grace = extraBoot ? PageSettleService.postBurnCookieGraceMs : PageSettleService.normalCookieGraceMs
+        let timeout = extraBoot ? PageSettleService.postBurnCookieTimeoutMs : PageSettleService.normalCookieTimeoutMs
+        _ = try? await webView.evaluateJavaScript(
+            JavaScriptInjectionService.waitForCookieNoticeScript(timeoutMs: timeout, graceMs: grace)
+        )
     }
 
     private func checkAllFinished() {
@@ -1061,7 +1087,7 @@ final class QuadController {
     var laneCount: Int { laneSessionAIndices.count }
 
     /// Compact-bar progress across every dual-site lane — sums the per-lane
-    /// completed and total counters so 6/8/9/12-window grids never show only
+    /// completed and total counters so 6/8/9/12/16-window grids never show only
     /// the first pair's numbers.
     var dualOverallProgress: (completed: Int, total: Int) {
         Self.overallProgress(
@@ -1258,6 +1284,7 @@ final class QuadController {
                 s.rcrSuccessCount = 0
                 s.rcrAwaitingNavigation = false
                 s.rcrExtraSubmitsInFlight = false
+                s.needsPostBurnSettle = false
             }
         }
 
@@ -1411,11 +1438,12 @@ final class QuadController {
             s.rcrBurnFlash &+= 1
             await QuadDataStore.burn(index: s.index)
             guard dualQuadActive, s.rcrRunning else { return }
+            s.needsPostBurnSettle = true
             s.rcrStatus = .navigating
             s.rcrAwaitingNavigation = true
             s.url = targetURL
             s.webView?.load(URLRequest(url: targetURL))
-            armRCRWatchdog(for: s)
+            armRCRWatchdog(for: s, timeout: PageSettleService.postBurnNavigationWatchdog)
             return
         }
 

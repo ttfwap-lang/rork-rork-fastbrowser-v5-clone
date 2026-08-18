@@ -8,6 +8,7 @@ enum WindowGridSize: Int, CaseIterable, Identifiable, Equatable {
     case eight = 8
     case nine = 9
     case twelve = 12
+    case sixteen = 16
 
     var id: Int { rawValue }
 
@@ -15,6 +16,7 @@ enum WindowGridSize: Int, CaseIterable, Identifiable, Equatable {
         switch self {
         case .four, .six, .eight: return 2
         case .nine, .twelve: return 3
+        case .sixteen: return 4
         }
     }
 
@@ -23,6 +25,7 @@ enum WindowGridSize: Int, CaseIterable, Identifiable, Equatable {
         case .four: return 2
         case .six, .nine: return 3
         case .eight, .twelve: return 4
+        case .sixteen: return 4
         }
     }
 

@@ -26,7 +26,7 @@ final class WebViewConfigurationFactory {
     }
 
     /// Multi-window entry point: isolated store + tile viewport normalization
-    /// so every grid size (2×2, 2×3, 4×2, 3×3, 3×4) renders a full-width page shrunk
+    /// so every grid size (2×2, 2×3, 4×2, 3×3, 3×4, 4×4) renders a full-width page shrunk
     /// to fit its tile instead of a squished mini layout.
     func makeIsolatedConfiguration(dataStoreID: UUID) -> WKWebViewConfiguration {
         makeIsolatedConfiguration(dataStoreID: dataStoreID, multiWindowViewport: true)

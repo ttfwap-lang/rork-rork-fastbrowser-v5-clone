@@ -11,13 +11,18 @@ struct WindowLayoutTests {
         #expect(WindowGridSize.nine.rows == 3)
         #expect(WindowGridSize.nine.columns == 3)
         #expect(WindowGridSize.nine.label == "3×3")
+        #expect(WindowGridSize.sixteen.rows == 4)
+        #expect(WindowGridSize.sixteen.columns == 4)
+        #expect(WindowGridSize.sixteen.label == "4×4")
+        #expect(WindowGridSize.sixteen.rawValue == 16)
+        #expect(WindowGridSize.sixteen.supportsDualSite)
     }
 
     @Test @MainActor
     func threeByThreeSupportsDualSiteWithDisabledCenter() {
         #expect(WindowGridSize.nine.supportsDualSite)
         #expect(WindowGridSize.nine.disabledIndexInDualSite == 4)
-        #expect(WindowGridSize.allCases.filter(\.supportsDualSite).map(\.rawValue) == [4, 6, 8, 9, 12])
+        #expect(WindowGridSize.allCases.filter(\.supportsDualSite).map(\.rawValue) == [4, 6, 8, 9, 12, 16])
     }
 
     @Test @MainActor
@@ -137,7 +142,7 @@ struct WindowLayoutTests {
         // math: with N credentials and L lanes, every lane gets floor(N/L)
         // or ceil(N/L). We verify this with several N/L combinations,
         // including the 4-lane case used by 3×3 dual-site mode.
-        let laneCounts: [Int] = [2, 3, 4, 6]
+        let laneCounts: [Int] = [2, 3, 4, 6, 8]
         let vaultSizes: [Int] = [10, 11, 23, 24, 25, 100]
         for lanes in laneCounts {
             for total in vaultSizes {
@@ -154,9 +159,9 @@ struct WindowLayoutTests {
 
     @Test @MainActor
     func normalModePartitionsEquallyAcrossAllWindowCounts() {
-        // Normal (single-site) mode uses all windows — 4, 6, 8, 9, 12.
+        // Normal (single-site) mode uses all windows — 4, 6, 8, 9, 12, 16.
         // Dual-site mode uses enabled sessions only: for 3×3 that's 8.
-        let windowCounts: [Int] = [4, 6, 8, 9, 12]
+        let windowCounts: [Int] = [4, 6, 8, 9, 12, 16]
         let vaultSizes: [Int] = [10, 25, 50, 100]
         for windows in windowCounts {
             for total in vaultSizes {
@@ -184,6 +189,12 @@ struct WindowLayoutTests {
         controller.setGridSize(.twelve)
         controller.applyDualSiteTargets(urlA: urlA, urlB: urlB, pattern: .horizontal)
         #expect(controller.laneCount == 6)
+
+        controller.setGridSize(.sixteen)
+        controller.applyDualSiteTargets(urlA: urlA, urlB: urlB, pattern: .vertical)
+        #expect(controller.activeCount == 16)
+        #expect(controller.laneCount == 8)
+        #expect(controller.enabledSessions.count == 16)
 
         // Every lane must pair one A + one B after the reassignment.
         for lane in 0..<controller.laneCount {
@@ -243,5 +254,33 @@ struct WindowLayoutTests {
             DualSiteSplitPattern.checkerboard.targetSiteIndex(for: idx, in: .eight)
         }
         #expect(horizontalAssignments != checkerboardAssignments)
+    }
+
+    @Test @MainActor
+    func sixteenWindowGridHasUniqueStoresAndEvenDualSplit() {
+        #expect(QuadDataStore.identifiers.count == QuadDataStore.maxSessionCount)
+        #expect(Set(QuadDataStore.identifiers).count == 16)
+        let controller = QuadController()
+        #expect(controller.sessions.count == 16)
+        #expect(Set(controller.sessions.map(\.storeID)).count == 16)
+
+        let urlA = URL(string: "https://a.example")!
+        let urlB = URL(string: "https://b.example")!
+        controller.setGridSize(.sixteen)
+        controller.applyDualSiteTargets(urlA: urlA, urlB: urlB, pattern: .checkerboard)
+        #expect(controller.activeSessions.filter { $0.targetSiteIndex == 0 }.count == 8)
+        #expect(controller.activeSessions.filter { $0.targetSiteIndex == 1 }.count == 8)
+        #expect(controller.laneCount == 8)
+    }
+
+    @Test
+    func pageSettleParsesLoginFormFlag() {
+        #expect(PageSettleService.parseHasLoginForm("{\"hasLoginForm\":true}"))
+        #expect(!PageSettleService.parseHasLoginForm("{\"hasLoginForm\":false}"))
+        #expect(!PageSettleService.parseHasLoginForm(nil))
+        #expect(!PageSettleService.parseHasLoginForm("not-json"))
+        #expect(!PageSettleService.parseHasLoginForm(42))
+        #expect(PageSettleService.postBurnCookieGraceMs > PageSettleService.normalCookieGraceMs)
+        #expect(PageSettleService.postBurnCookieTimeoutMs > PageSettleService.normalCookieTimeoutMs)
     }
 }

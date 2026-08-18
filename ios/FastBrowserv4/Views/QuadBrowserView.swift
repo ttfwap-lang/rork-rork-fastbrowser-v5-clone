@@ -186,7 +186,7 @@ struct QuadCellWebView: UIViewRepresentable {
     }
 }
 
-/// Grid of isolated browser sessions — 2×2, 2×3, 4×2, 3×3, or 3×4 depending
+/// Grid of isolated browser sessions — 2×2, 2×3, 4×2, 3×3, 3×4, or 4×4 depending
 /// on the active `WindowGridSize`. The cell that's currently "focused" (tap to
 /// switch) gets a cyan ring and is the target for the shared URL bar /
 /// toolbar.
@@ -199,7 +199,7 @@ struct QuadBrowserView: View {
             let spacing: CGFloat = 1
             // Floor each cell size so every tile is identical; leftover
             // fractional pixels are absorbed by centered gutters so 6- and
-            // 12-window grids never leave uneven rows/columns.
+            // 12- and 16-window grids never leave uneven rows/columns.
             let totalHSpacing = spacing * CGFloat(max(0, size.columns - 1))
             let totalVSpacing = spacing * CGFloat(max(0, size.rows - 1))
             let cellW = floor((geo.size.width - totalHSpacing) / CGFloat(size.columns))

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Compact progress summary shown for the 6- and 12-window grids instead of
+/// Compact progress summary shown for the 6-, 8-, 9-, 12-, and 16-window grids instead of
 /// a full stack of per-window cards. Tapping it expands into the detailed
 /// per-window view (see `BrowserView.quadSummarySection`).
 struct QuadSummaryBarView: View {

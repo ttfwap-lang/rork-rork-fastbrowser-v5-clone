@@ -111,7 +111,7 @@ struct AppSettingsView: View {
             } header: {
                 Text("Dual-Site Targets")
             } footer: {
-                Text("Dual-site mode is available for every grid size. Horizontal, vertical, and checkerboard layouts always assign half the tiles to each URL. The 3×3 grid leaves its center tile unused, splitting the remaining eight tiles evenly.")
+                Text("Dual-site mode is available for every grid size, including 4×4 (16 windows). Horizontal, vertical, and checkerboard layouts always assign half the tiles to each URL. The 3×3 grid leaves its center tile unused, splitting the remaining eight tiles evenly.")
             }
 
             Section {

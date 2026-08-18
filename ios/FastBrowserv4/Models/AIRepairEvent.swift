@@ -12,7 +12,7 @@ final class AIRepairEvent {
     var timestamp: Date
     /// Domain the event concerns ("" when not site-specific).
     var domain: String
-    /// Session tag — "single" or "S1"…"S12".
+    /// Session tag — "single" or "S1"…"S16".
     var sessionTag: String
     /// "heal" | "judge" | "info"
     var kind: String

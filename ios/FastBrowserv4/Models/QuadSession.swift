@@ -2,8 +2,8 @@ import Foundation
 import SwiftUI
 import WebKit
 
-/// One of up to twelve parallel browser sessions used in multi-window mode
-/// (grids of 4, 6, 8, 9, or 12). Owns its own WKWebView (with an isolated
+/// One of up to sixteen parallel browser sessions used in multi-window mode
+/// (grids of 4, 6, 8, 9, 12, or 16). Owns its own WKWebView (with an isolated
 /// `WKWebsiteDataStore`) and its own RCR progress so every session can run
 /// completely independently of the others.
 @Observable
@@ -67,6 +67,9 @@ final class QuadSession: Identifiable {
     /// True while the runner is performing the configured extra submits.
     /// All other RCR actions are paused until this clears.
     var rcrExtraSubmitsInFlight: Bool = false
+    /// Set when this window just burned a perm-disabled session. The next
+    /// navigation must wait for page boot + cookie consent before filling.
+    var needsPostBurnSettle: Bool = false
 
     init(index: Int) {
         self.index = index

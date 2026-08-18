@@ -64,6 +64,9 @@ class BrowserViewModel {
     /// (sure-login). All RCR actions — result observation, advancing,
     /// burning — are paused until this clears.
     var rcrExtraSubmitsInFlight: Bool = false
+    /// Set after a perm-disabled burn so the next credential waits for
+    /// page boot + cookie consent before autofill.
+    private var needsPostBurnSettle: Bool = false
     /// Queue snapshot built at run start. Mirrors the order the runner walks
     /// so the UI can show "Next 8" and "Completed" without recomputing.
     var rcrQueueUsernames: [String] = []
@@ -1140,6 +1143,7 @@ class BrowserViewModel {
         rcrQueuePasswordCounts = counts
         rcrTotal = credIDs.count
         rcrCompletedIDs = []
+        needsPostBurnSettle = false
 
         // If the entire vault was previously finished against this same
         // target, treat this press as "start over" — wipe attempt history
@@ -1205,6 +1209,7 @@ class BrowserViewModel {
         isRCRRunning = false
         rcrStatus = .idle
         rcrAwaitingNavigation = false
+        needsPostBurnSettle = false
         rcrTargetURL = nil
         // Don't leave plaintext passwords sitting in memory after a stop.
         rcrCurrentPasswords = []
@@ -1477,10 +1482,10 @@ class BrowserViewModel {
     /// within the timeout (navigation failure, dead page, wedged web
     /// process), the attempt is recorded as failed and the run advances —
     /// previously the runner sat in "watching" forever.
-    private func armRCRWatchdog() {
+    private func armRCRWatchdog(timeout: Duration = rcrWatchdogTimeout) {
         rcrWatchdogTask?.cancel()
         rcrWatchdogTask = Task { [weak self] in
-            try? await Task.sleep(for: Self.rcrWatchdogTimeout)
+            try? await Task.sleep(for: timeout)
             guard let self, !Task.isCancelled else { return }
             self.rcrWatchdogFired()
         }
@@ -1522,12 +1527,11 @@ class BrowserViewModel {
             // longer relevant; attemptFill arms the observation watchdog.
             cancelRCRWatchdog()
             // A cookie/consent popup only ever shows up on a window's first
-            // load or right after a burn+reload — both of which land here.
-            // Wait for it to appear-and-dismiss (or time out) before filling
-            // in the next login.
+            // load or right after a burn+reload. After a perm-disabled burn
+            // the next credential gets extra boot + consent time so the
+            // login form is actually ready before we fill.
             Task {
-                await self.waitForCookieNoticeIfNeeded()
-                await self.attemptFill()
+                await self.settleThenFill()
             }
             return
         }
@@ -1653,11 +1657,34 @@ class BrowserViewModel {
         }
     }
 
-    /// Waits (up to ~10s) for a cookie/consent banner to appear and be
-    /// dismissed. No-op if no banner is present when called.
-    private func waitForCookieNoticeIfNeeded() async {
+    /// After a navigation finishes: wait for cookie/consent (and, after a
+    /// burn, extra page-boot + login-form time) then start the fill.
+    private func settleThenFill() async {
+        let extra = needsPostBurnSettle
+        needsPostBurnSettle = false
+        await waitForCookieNoticeIfNeeded(extraBoot: extra)
+        guard isRCRRunning else { return }
+        if extra, let webView = activeTab?.webView {
+            await PageSettleService.waitForLoginForm(in: webView)
+            guard isRCRRunning else { return }
+        }
+        await attemptFill()
+    }
+
+    /// Waits for a cookie/consent banner to appear and be dismissed.
+    /// After a burn, gives the page extra time to boot and the CMP extra
+    /// time to inject before concluding there is no banner.
+    private func waitForCookieNoticeIfNeeded(extraBoot: Bool) async {
         guard let webView = activeTab?.webView else { return }
-        _ = try? await webView.evaluateJavaScript(JavaScriptInjectionService.waitForCookieNoticeScript())
+        if extraBoot {
+            try? await Task.sleep(for: PageSettleService.postBurnBootDelay)
+            guard isRCRRunning else { return }
+        }
+        let grace = extraBoot ? PageSettleService.postBurnCookieGraceMs : PageSettleService.normalCookieGraceMs
+        let timeout = extraBoot ? PageSettleService.postBurnCookieTimeoutMs : PageSettleService.normalCookieTimeoutMs
+        _ = try? await webView.evaluateJavaScript(
+            JavaScriptInjectionService.waitForCookieNoticeScript(timeoutMs: timeout, graceMs: grace)
+        )
     }
 
     private func burnAndAdvance(completedID: String) async {
@@ -1668,6 +1695,7 @@ class BrowserViewModel {
         rcrCompletedIDs.insert(completedID)
         rcrIndex += 1
         rcrPasswordIndex = 0
+        needsPostBurnSettle = true
 
         if let target = rcrTargetURL {
             rcrStatus = .navigating
@@ -1675,7 +1703,7 @@ class BrowserViewModel {
             activeTab?.url = target
             activeTab?.lastURL = target
             activeTab?.webView?.load(URLRequest(url: target))
-            armRCRWatchdog()
+            armRCRWatchdog(timeout: PageSettleService.postBurnNavigationWatchdog)
             return
         }
         await runCurrentCredential()

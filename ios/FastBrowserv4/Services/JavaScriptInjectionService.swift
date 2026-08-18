@@ -542,7 +542,7 @@ struct JavaScriptInjectionService {
     /// reflowing into the tile's own tiny physical width. WebKit's standard
     /// mobile viewport auto-fit then shrinks that normal layout down to
     /// whatever the tile's actual size is — giving every grid size (2×2,
-    /// 2×3, 4×2, 3×3, 3×4) an automatic, always-correct "zoomed out" view of the
+    /// 2×3, 4×2, 3×3, 3×4, 4×4) an automatic, always-correct "zoomed out" view of the
     /// complete page instead of a squished/overlapping mobile layout.
     /// Re-asserts itself if the page's own scripts replace the viewport tag
     /// later (SPA-style sites), and again on DOMContentLoaded as a safety net
@@ -605,7 +605,14 @@ struct JavaScriptInjectionService {
                 '.consent-banner', '.consentBanner', '.consent-modal', '.consentModal',
                 '#consent-banner', '#consentBanner', '#consent-modal', '#consentModal',
                 '.eu-cookie', '.euCookie', '.privacy-banner', '.privacyBanner',
-                '#privacy-banner', '#privacyBanner'
+                '#privacy-banner', '#privacyBanner',
+                '#onetrust-banner-sdk', '#onetrust-consent-sdk', '.onetrust-pc-dark-filter',
+                '#CybotCookiebotDialog', '#CybotCookiebotDialogBody',
+                '.qc-cmp2-container', '.qc-cmp2-summary-buttons',
+                '#didomi-host', '.didomi-popup-container',
+                '#truste-consent-track', '.truste_overlay', '.truste_box_overlay',
+                '.osano-cm-dialog', '#osano-cm-dom-info-dialog-open',
+                '.sp_choice_type_11', '#sp_message_container_'
             ];
             // Attribute selectors for cookie/consent labelled elements.
             var attrSelectors = [
@@ -618,7 +625,39 @@ struct JavaScriptInjectionService {
             ];
             var allSelectors = selectors.concat(attrSelectors);
             window.__ffb_cookieSelectors = allSelectors;
+            var clickAccept = function() {
+                var known = [
+                    '#onetrust-accept-btn-handler',
+                    '#onetrust-pc-btn-handler',
+                    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+                    '#CybotCookiebotDialogBodyButtonAccept',
+                    '.qc-cmp2-summary-buttons button[mode="primary"]',
+                    '#didomi-notice-agree-button',
+                    '.osano-cm-accept-all',
+                    'button[id*="accept-all" i]',
+                    'button[class*="accept-all" i]',
+                    'button[aria-label*="accept" i]'
+                ];
+                for (var n = 0; n < known.length; n++) {
+                    try {
+                        var hit = document.querySelector(known[n]);
+                        if (hit) { hit.click(); return true; }
+                    } catch(e) {}
+                }
+                var buttons = document.querySelectorAll('button, a, [role="button"], input[type="button"]');
+                for (var b = 0; b < buttons.length; b++) {
+                    try {
+                        var t = ((buttons[b].innerText || buttons[b].value || '') + '').replace(/\\s+/g, ' ').trim();
+                        if (/^(accept( all)?|agree|allow( all)?|i agree|got it|ok)$/i.test(t)) {
+                            buttons[b].click();
+                            return true;
+                        }
+                    } catch(e) {}
+                }
+                return false;
+            };
             var removeMatches = function() {
+                clickAccept();
                 for (var i = 0; i < allSelectors.length; i++) {
                     try {
                         var els = document.querySelectorAll(allSelectors[i]);
@@ -667,7 +706,10 @@ struct JavaScriptInjectionService {
     /// banner exists at call time — it gives the page a short grace window
     /// (~1.5s) for a dynamically-injected banner to appear, then polls via
     /// MutationObserver until dismissed or the full timeout elapses.
-    static func waitForCookieNoticeScript(timeoutMs: Int = 10000) -> String {
+    static func waitForCookieNoticeScript(
+        timeoutMs: Int = 10000,
+        graceMs: Int = 1500
+    ) -> String {
         return """
         (function() {
             return new Promise(function(resolve) {
@@ -679,42 +721,68 @@ struct JavaScriptInjectionService {
                         }
                         return false;
                     };
+                    var clickAccept = function() {
+                        var known = [
+                            '#onetrust-accept-btn-handler',
+                            '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+                            '#CybotCookiebotDialogBodyButtonAccept',
+                            '.qc-cmp2-summary-buttons button[mode="primary"]',
+                            '#didomi-notice-agree-button',
+                            '.osano-cm-accept-all',
+                            'button[id*="accept-all" i]',
+                            'button[aria-label*="accept" i]'
+                        ];
+                        for (var n = 0; n < known.length; n++) {
+                            try {
+                                var hit = document.querySelector(known[n]);
+                                if (hit) { hit.click(); return true; }
+                            } catch(e) {}
+                        }
+                        var buttons = document.querySelectorAll('button, a, [role="button"], input[type="button"]');
+                        for (var b = 0; b < buttons.length; b++) {
+                            try {
+                                var t = ((buttons[b].innerText || buttons[b].value || '') + '').replace(/\\s+/g, ' ').trim();
+                                if (/^(accept( all)?|agree|allow( all)?|i agree|got it|ok)$/i.test(t)) {
+                                    buttons[b].click();
+                                    return true;
+                                }
+                            } catch(e) {}
+                        }
+                        return false;
+                    };
                     var done = false;
                     var obs = null;
                     var timer = null;
+                    var pokeTimer = null;
                     var finish = function(reason) {
                         if (done) return;
                         done = true;
                         try { if (obs) obs.disconnect(); } catch(e) {}
                         try { if (timer) clearTimeout(timer); } catch(e) {}
+                        try { if (pokeTimer) clearInterval(pokeTimer); } catch(e) {}
                         resolve(JSON.stringify({ waited: true, reason: reason }));
                     };
-                    // Give the page a short grace window (~1.5s) for a
-                    // dynamically-injected banner to appear before we
-                    // conclude there isn't one.
                     var startObserving = function() {
                         if (matches()) {
+                            clickAccept();
+                            pokeTimer = setInterval(function() {
+                                if (!matches()) { finish('dismissed'); return; }
+                                clickAccept();
+                            }, 400);
                             obs = new MutationObserver(function() {
                                 if (!matches()) finish('dismissed');
                             });
                             obs.observe(document.documentElement, { childList: true, subtree: true });
                         } else {
-                            // Still nothing — bail without blocking.
                             finish('none');
                         }
                     };
                     if (matches()) {
-                        // Banner already present — start watching immediately.
                         startObserving();
                     } else {
-                        // No banner yet — wait up to 1.5s for one to appear
-                        // before giving up. This prevents the race where
-                        // didFinish fires before the consent script injects
-                        // the banner DOM.
                         var graceTimer = setTimeout(function() {
                             startObserving();
-                        }, 1500);
-                        // But also watch for early appearance.
+                        }, \(graceMs));
                         obs = new MutationObserver(function() {
                             if (matches()) {
                                 try { clearTimeout(graceTimer); } catch(e) {}

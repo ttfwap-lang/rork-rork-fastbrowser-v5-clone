@@ -1,12 +1,15 @@
 import Foundation
 import WebKit
 
-/// Stable, persistent WebKit data-store identifiers for the up-to-twelve
-/// multi-window sessions. Using `WKWebsiteDataStore(forIdentifier:)` (iOS
-/// 17+) gives each session its own fully isolated cookies, cache, local
-/// storage and IndexedDB — no window can ever see another window's data or
-/// fingerprint, at any grid size.
+/// Stable, persistent WebKit data-store identifiers for every multi-window
+/// session (up to 16). Using `WKWebsiteDataStore(forIdentifier:)` gives each
+/// session its own fully isolated cookies, cache, local storage and
+/// IndexedDB — no window can ever see another window's data, at any grid
+/// size. Identifiers are 1:1 with session index — never wrap with `%` or
+/// two tiles would share a store.
 enum QuadDataStore {
+    static let maxSessionCount = 16
+
     static let identifiers: [UUID] = [
         UUID(uuidString: "A1A1A1A1-0001-4000-8000-000000000001")!,
         UUID(uuidString: "A2A2A2A2-0002-4000-8000-000000000002")!,
@@ -19,11 +22,15 @@ enum QuadDataStore {
         UUID(uuidString: "A9A9A9A9-0009-4000-8000-000000000009")!,
         UUID(uuidString: "B1B1B1B1-0010-4000-8000-000000000010")!,
         UUID(uuidString: "B2B2B2B2-0011-4000-8000-000000000011")!,
-        UUID(uuidString: "B3B3B3B3-0012-4000-8000-000000000012")!
+        UUID(uuidString: "B3B3B3B3-0012-4000-8000-000000000012")!,
+        UUID(uuidString: "B4B4B4B4-0013-4000-8000-000000000013")!,
+        UUID(uuidString: "B5B5B5B5-0014-4000-8000-000000000014")!,
+        UUID(uuidString: "B6B6B6B6-0015-4000-8000-000000000015")!,
+        UUID(uuidString: "B7B7B7B7-0016-4000-8000-000000000016")!
     ]
 
     static func identifier(for index: Int) -> UUID {
-        identifiers[index % identifiers.count]
+        identifiers[index]
     }
 
     /// Wipes every byte of state for the given Quad session — cookies,

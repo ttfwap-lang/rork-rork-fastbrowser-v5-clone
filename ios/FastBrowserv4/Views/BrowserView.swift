@@ -10,8 +10,8 @@ struct BrowserView: View {
     // Swipe-to-hide state for the live RCR queue pill(s).
     @State private var singlePillHidden: Bool = false
     @State private var singlePillDrag: CGFloat = 0
-    @State private var quadPillsHidden: [Bool] = Array(repeating: false, count: 12)
-    @State private var quadPillsDrag: [CGFloat] = Array(repeating: 0, count: 12)
+    @State private var quadPillsHidden: [Bool] = Array(repeating: false, count: QuadDataStore.maxSessionCount)
+    @State private var quadPillsDrag: [CGFloat] = Array(repeating: 0, count: QuadDataStore.maxSessionCount)
     // Larger grids show a compact summary bar instead of a wall of per-window
     // cards; tapping it expands to the same detailed view.
     @State private var isQuadDetailExpanded: Bool = false
@@ -55,8 +55,8 @@ struct BrowserView: View {
         }
         .onChange(of: viewModel.quadMode) { _, _ in
             isQuadDetailExpanded = false
-            quadPillsHidden = Array(repeating: false, count: 12)
-            quadPillsDrag = Array(repeating: 0, count: 12)
+            quadPillsHidden = Array(repeating: false, count: QuadDataStore.maxSessionCount)
+            quadPillsDrag = Array(repeating: 0, count: QuadDataStore.maxSessionCount)
         }
         .onChange(of: viewModel.quadController.focusedIndex) { _, _ in
             if viewModel.isQuadMode, !viewModel.isURLBarEditing {
