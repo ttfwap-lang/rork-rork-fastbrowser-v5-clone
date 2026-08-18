@@ -15,6 +15,7 @@ struct BrowserView: View {
     // Larger grids show a compact summary bar instead of a wall of per-window
     // cards; tapping it expands to the same detailed view.
     @State private var isQuadDetailExpanded: Bool = false
+    private let diagnostics = WindowDiagnosticsService.shared
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -307,8 +308,22 @@ struct BrowserView: View {
             if viewModel.isQuadMode {
                 QuadBrowserView(controller: viewModel.quadController)
             } else if let tab = viewModel.activeTab, tab.url != nil {
-                WebViewWrapper(tab: tab, viewModel: viewModel)
-                    .id(tab.id)
+                ZStack(alignment: .bottomLeading) {
+                    WebViewWrapper(tab: tab, viewModel: viewModel)
+                        .id(tab.id)
+                    if diagnostics.overlayEnabled {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ProcessMemoryStrip(sample: diagnostics.processSample, windowCount: 1)
+                            WindowDiagnosticsBadge(
+                                title: "S1",
+                                snapshot: tab.memorySnapshot,
+                                report: tab.leakCheck,
+                                compact: false
+                            )
+                        }
+                        .padding(10)
+                    }
+                }
             } else {
                 speedDialHome
             }
@@ -788,6 +803,14 @@ struct BrowserView: View {
             }
             Button("Reload", systemImage: "arrow.clockwise") {
                 viewModel.reload()
+            }
+            Button {
+                diagnostics.overlayEnabled.toggle()
+            } label: {
+                Label(
+                    diagnostics.overlayEnabled ? "Hide Diagnostics" : "Show Diagnostics",
+                    systemImage: "memorychip"
+                )
             }
             Divider()
             Button("Settings", systemImage: "gear") {

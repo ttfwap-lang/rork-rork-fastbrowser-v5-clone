@@ -101,6 +101,8 @@ struct WebViewWrapper: UIViewRepresentable {
                     viewModel?.addHistoryEntry(url: url, title: tab.title, tabID: tab.id)
                 }
 
+                WindowDiagnosticsService.shared.pageDidFinish(tab: tab)
+
                 if viewModel?.isRCRRunning == true {
                     viewModel?.rcrPageDidFinish()
                 } else {

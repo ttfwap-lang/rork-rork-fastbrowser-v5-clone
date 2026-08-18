@@ -185,6 +185,7 @@ class BrowserViewModel {
             addNewTab()
         }
         quadController.setup(modelContext: modelContext, browser: self)
+        WindowDiagnosticsService.shared.attach(controller: quadController, browser: self)
         startCookiePurgeTimer()
         resetURLBarTimer()
     }
@@ -770,6 +771,7 @@ class BrowserViewModel {
 
         Task { @MainActor in
             // Wipe only this tab's isolated store — other tabs stay intact.
+            WindowDiagnosticsService.shared.noteBurn(tab: tab)
             await QuadDataStore.burn(dataStoreID: storeID)
             if let context = self.modelContext, !domain.isEmpty {
                 try? context.delete(
@@ -795,6 +797,7 @@ class BrowserViewModel {
         let url = session.webView?.url ?? session.url ?? Self.defaultHomeURL
         let index = session.index
         Task { @MainActor in
+            WindowDiagnosticsService.shared.noteBurn(session: session)
             await QuadDataStore.burn(index: index)
             session.webView?.load(URLRequest(url: url))
             self.rcrBurnFlash &+= 1
@@ -1717,6 +1720,7 @@ class BrowserViewModel {
         // Single-window RCR burns only the active tab's isolated store so
         // other open tabs keep their cookies/session state.
         if let tab = activeTab {
+            WindowDiagnosticsService.shared.noteBurn(tab: tab)
             await QuadDataStore.burn(dataStoreID: tab.dataStoreID)
         }
 

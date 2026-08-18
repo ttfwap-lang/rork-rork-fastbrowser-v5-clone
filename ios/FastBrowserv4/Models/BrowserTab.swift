@@ -19,6 +19,10 @@ class BrowserTab: Identifiable {
     var webView: WKWebView?
     var lastURL: URL?
     var snapshot: UIImage?
+    /// Latest attributed memory sample for the diagnostic overlay.
+    var memorySnapshot: WindowMemorySnapshot?
+    /// Latest automated leak-check result for this tab.
+    var leakCheck: WindowLeakCheckReport = .idle
 
     init(url: URL? = nil, dataStoreID: UUID = UUID()) {
         self.id = UUID().uuidString

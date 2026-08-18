@@ -106,6 +106,7 @@ struct QuadCellWebView: UIViewRepresentable {
                     controller?.hostBrowser?.updateURLBar()
                 }
                 controller?.cellPageDidFinish(session: session)
+                WindowDiagnosticsService.shared.pageDidFinish(session: session)
                 // Page-load autofill for multi-window tiles (skips while any
                 // RCR run is active).
                 if !session.rcrRunning {
@@ -192,6 +193,7 @@ struct QuadCellWebView: UIViewRepresentable {
 /// toolbar.
 struct QuadBrowserView: View {
     @Bindable var controller: QuadController
+    private let diagnostics = WindowDiagnosticsService.shared
 
     var body: some View {
         GeometryReader { geo in
@@ -232,6 +234,15 @@ struct QuadBrowserView: View {
             .padding(.vertical, vPad)
             .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
             .background(Color.black)
+            .overlay(alignment: .top) {
+                if diagnostics.overlayEnabled {
+                    ProcessMemoryStrip(
+                        sample: diagnostics.processSample,
+                        windowCount: controller.enabledSessions.count
+                    )
+                    .padding(.top, 4)
+                }
+            }
         }
     }
 
@@ -292,6 +303,22 @@ struct QuadBrowserView: View {
                         Spacer(minLength: 0)
                     }
                     Spacer(minLength: 0)
+                }
+
+                if diagnostics.overlayEnabled {
+                    VStack {
+                        Spacer(minLength: 0)
+                        HStack {
+                            WindowDiagnosticsBadge(
+                                title: session.id,
+                                snapshot: session.memorySnapshot,
+                                report: session.leakCheck,
+                                compact: controller.gridSize.rawValue >= 8
+                            )
+                            .padding(6)
+                            Spacer(minLength: 0)
+                        }
+                    }
                 }
 
                 if session.isLoading {

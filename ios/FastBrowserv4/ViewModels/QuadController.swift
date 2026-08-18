@@ -858,6 +858,7 @@ final class QuadController {
     private func burnAndAdvance(session s: QuadSession, completedID: String) async {
         s.rcrStatus = .burning
         s.rcrBurnFlash &+= 1
+        WindowDiagnosticsService.shared.noteBurn(session: s)
         await QuadDataStore.burn(index: s.index)
         s.rcrCompletedIDs.insert(completedID)
         s.rcrIndex += 1

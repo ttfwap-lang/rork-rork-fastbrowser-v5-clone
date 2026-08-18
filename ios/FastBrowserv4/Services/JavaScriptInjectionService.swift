@@ -901,6 +901,27 @@ struct JavaScriptInjectionService {
         "window.__ffb_rcrActive = false;"
     }
 
+    /// DOM weight used to split the process memory footprint across windows.
+    static func pageMemoryMetricsScript() -> String {
+        return """
+        (function() {
+            try {
+                var html = '';
+                try { html = (document.documentElement && document.documentElement.outerHTML) ? document.documentElement.outerHTML : ''; } catch (e) {}
+                return JSON.stringify({
+                    htmlBytes: html.length,
+                    nodes: document.querySelectorAll('*').length,
+                    images: document.images ? document.images.length : 0,
+                    iframes: document.querySelectorAll('iframe').length,
+                    scripts: document.scripts ? document.scripts.length : 0
+                });
+            } catch (e) {
+                return JSON.stringify({ htmlBytes: 0, nodes: 0, images: 0, iframes: 0, scripts: 0 });
+            }
+        })();
+        """
+    }
+
     static func extractFilledCredentialsScript() -> String {
         return """
         (function() {

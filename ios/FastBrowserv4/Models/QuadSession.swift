@@ -70,6 +70,10 @@ final class QuadSession: Identifiable {
     /// Set when this window just burned a perm-disabled session. The next
     /// navigation must wait for page boot + cookie consent before filling.
     var needsPostBurnSettle: Bool = false
+    /// Latest attributed memory sample for the diagnostic overlay.
+    var memorySnapshot: WindowMemorySnapshot?
+    /// Latest automated leak-check result for this window.
+    var leakCheck: WindowLeakCheckReport = .idle
 
     init(index: Int) {
         self.index = index

@@ -12,6 +12,7 @@ struct AppSettingsView: View {
     @AppStorage("dualQuadURL_A") private var dualQuadURL_A: String = "https://www.ignitioncasino.ooo/login"
     @AppStorage("dualQuadURL_B") private var dualQuadURL_B: String = "https://joefortune.win/login"
     @AppStorage("dualSiteSplitPattern") private var dualSiteSplitPatternRawValue: String = DualSiteSplitPattern.checkerboard.rawValue
+    @AppStorage("windowDiagnosticsEnabled") private var windowDiagnosticsEnabled: Bool = true
     @State private var isShowingExcludedDomains: Bool = false
 
     var body: some View {
@@ -112,6 +113,17 @@ struct AppSettingsView: View {
                 Text("Dual-Site Targets")
             } footer: {
                 Text("Dual-site mode is available for every grid size, including 4×4 (16 windows). Horizontal, vertical, and checkerboard layouts always assign half the tiles to each URL. The 3×3 grid leaves its center tile unused, splitting the remaining eight tiles evenly.")
+            }
+
+            Section {
+                Toggle("Window Diagnostics", isOn: $windowDiagnosticsEnabled)
+                    .onChange(of: windowDiagnosticsEnabled) { _, enabled in
+                        WindowDiagnosticsService.shared.overlayEnabled = enabled
+                    }
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("Shows estimated memory for each window and the latest automated leak-check: store isolation, cookie leak, burn wipe, and process pressure. Useful when running 8–16 windows.")
             }
 
             Section {
