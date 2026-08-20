@@ -29,6 +29,9 @@ struct BrowserView: View {
                 bottomToolbar
             }
 
+            ParkedSessionRailOverlay(viewModel: viewModel)
+                .zIndex(80)
+
             if viewModel.toastVisible, let message = viewModel.toastMessage {
                 ToastView(message: message)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -310,7 +313,7 @@ struct BrowserView: View {
             } else if let tab = viewModel.activeTab, tab.url != nil {
                 ZStack(alignment: .bottomLeading) {
                     WebViewWrapper(tab: tab, viewModel: viewModel)
-                        .id(tab.id)
+                        .id("\(tab.id)-\(tab.webViewGeneration)")
                     if diagnostics.overlayEnabled {
                         VStack(alignment: .leading, spacing: 6) {
                             ProcessMemoryStrip(sample: diagnostics.processSample, windowCount: 1)

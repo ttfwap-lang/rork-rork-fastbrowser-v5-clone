@@ -82,6 +82,9 @@ class BrowserViewModel {
     private var rcrCurrentPasswords: [String] = []
     private var rcrPasswordIndex: Int = 0
     private var rcrAwaitingNavigation: Bool = false
+    /// True while the success cascade is capturing / asking the AI so a
+    /// second observer ping cannot double-advance the same attempt.
+    private var rcrJudging: Bool = false
     private var isQuadToggling: Bool = false
     private let rcrLastCompletedKey = "rcrLastCompletedID"
     /// Re-entrancy latch: set synchronously the moment the user taps RCR,
@@ -180,6 +183,7 @@ class BrowserViewModel {
         migrateLegacyBuiltInURLs()
         self.modelContext = modelContext
         IntelligenceCenter.shared.attach(context: modelContext)
+        ParkedSessionStore.shared.attach(context: modelContext)
         reloadExcludedDomains()
         if tabs.isEmpty {
             addNewTab()
@@ -296,9 +300,11 @@ class BrowserViewModel {
         tabs.remove(at: index)
 
         // Drop process-pool + wipe store so a recycled tab never inherits
-        // the closed tab's browsing identity.
-        Task {
-            await QuadDataStore.burn(dataStoreID: storeID)
+        // the closed tab's browsing identity. Never burn a parked store.
+        if !ParkedSessionStore.shared.contains(storeID: storeID) {
+            Task {
+                await QuadDataStore.burn(dataStoreID: storeID)
+            }
         }
 
         if let activeTabID, let preservedIndex = tabs.firstIndex(where: { $0.id == activeTabID }) {
@@ -795,10 +801,11 @@ class BrowserViewModel {
     func burnQuadFocused() {
         let session = quadController.focusedSession
         let url = session.webView?.url ?? session.url ?? Self.defaultHomeURL
-        let index = session.index
         Task { @MainActor in
             WindowDiagnosticsService.shared.noteBurn(session: session)
-            await QuadDataStore.burn(index: index)
+            if !ParkedSessionStore.shared.contains(storeID: session.storeID) {
+                await QuadDataStore.burn(dataStoreID: session.storeID)
+            }
             session.webView?.load(URLRequest(url: url))
             self.rcrBurnFlash &+= 1
             self.showToast("Cell \(session.id) burned & reloaded")
@@ -1202,6 +1209,7 @@ class BrowserViewModel {
         // Fresh run → fresh healer retry budget, so a site that hit its
         // per-domain repair cap on a previous run is eligible again.
         FillHealerEngine.shared.resetRunBudget()
+        ParkedSessionStore.shared.markRunStarted()
         isRCRRunning = true
         rcrStatus = .navigating
         Task { await runCurrentCredential() }
@@ -1212,6 +1220,7 @@ class BrowserViewModel {
         isStartingRCR = false
         rcrStartGeneration &+= 1
         cancelRCRWatchdog()
+        rcrJudging = false
         isRCRRunning = false
         rcrStatus = .idle
         rcrAwaitingNavigation = false
@@ -1228,6 +1237,7 @@ class BrowserViewModel {
             completionHandler: nil
         )
         if let reason { showToast(reason) }
+        ParkedSessionStore.shared.markRunFinished()
         resetURLBarTimer()
         if isDualQuadMode {
             resetURLBarBTimer()
@@ -1562,15 +1572,10 @@ class BrowserViewModel {
     func handleRCRStateMessage(_ payload: [String: Any]) {
         guard isRCRRunning, rcrStatus == .waiting else { return }
         if rcrExtraSubmitsInFlight { return }
+        if rcrJudging { return }
         // NOTE: the watchdog stays armed on purpose — an actionable payload
         // advances the run (which re-arms), while a page that mutates
         // without ever resolving still needs the watchdog to fire.
-        let hasPassword = payload["hasPassword"] as? Bool ?? false
-        let hasWelcome = payload["hasWelcome"] as? Bool ?? false
-        let hasDisabled = payload["hasDisabled"] as? Bool ?? false
-        let hasTempDisabled = payload["hasTempDisabled"] as? Bool ?? false
-        let hasSuccess = payload["hasSuccess"] as? Bool ?? false
-        let isHomepage = payload["isHomepage"] as? Bool ?? false
 
         guard let credential = currentRCRCredential() else {
             rcrIndex += 1
@@ -1579,80 +1584,179 @@ class BrowserViewModel {
         }
 
         let password = rcrCurrentPasswords[safe: rcrPasswordIndex] ?? ""
+        let signal = SuccessJudgeEngine.classifyLocal(payload)
 
-        // 1) Success: record + capture, then advance to NEXT credential.
-        if hasWelcome || hasSuccess || (isHomepage && !hasPassword) {
-            rcrStatus = .success
-            persistRCRProgress(completedID: credential.id)
-            rcrCompletedIDs.insert(credential.id)
-            captureAndRecord(
-                credential: credential,
-                password: password,
-                status: .success
-            )
-            showToast("Login succeeded — \(credential.username)")
-            rcrIndex += 1
-            rcrPasswordIndex = 0
-            Task { await runCurrentCredential() }
-            return
-        }
-
-        // 2) Permanent disabled: mark globally, capture proof, delete the
-        // credential from the vault for good, burn, then advance.
-        if hasDisabled {
-            PermaDisabledStore.shared.markDisabled(credentialID: credential.id)
-            captureAndRecord(
-                credential: credential,
-                password: password,
-                status: .disabled
-            )
-            // Capture before deletion — reading a property off a deleted
-            // SwiftData model can fault.
-            let deletedID = credential.id
-            deleteCredentialPermanently(credential)
-            Task { await burnAndAdvance(completedID: deletedID) }
-            return
-        }
-
-        // 2b) Temporary disabled: park the credential for 1 hour ONLY if
-        // it still has more passwords waiting; otherwise advance like a
-        // normal failed attempt. (With a single password the "try next"
-        // branch could never run — it is deliberately not special-cased.)
-        if hasTempDisabled {
-            captureAndRecord(
-                credential: credential,
-                password: password,
-                status: .tempDisabled
-            )
-            if rcrCurrentPasswords.count > 1 {
-                TempDisabledStore.shared.markDisabled(credentialID: credential.id)
-                showToast("Temp-disabled — \(credential.username) (1h cooldown)")
+        switch signal {
+        case .disabled:
+            applyLocalDisabled(credential: credential, password: password)
+        case .tempDisabled:
+            applyLocalTempDisabled(credential: credential, password: password)
+        case .stillOnLogin:
+            ParkedSessionStore.shared.recordFailure()
+            captureAndRecord(credential: credential, password: password, status: .failed)
+            advanceAfterFailure()
+        case .apparentSuccess, .unclear:
+            rcrJudging = true
+            cancelRCRWatchdog()
+            let credID = credential.id
+            Task {
+                await self.judgeAndAdvance(payload: payload, credentialID: credID, password: password)
+                self.rcrJudging = false
             }
+        }
+    }
+
+    private func applyLocalDisabled(credential: Credential, password: String) {
+        ParkedSessionStore.shared.recordFailure()
+        PermaDisabledStore.shared.markDisabled(credentialID: credential.id)
+        captureAndRecord(credential: credential, password: password, status: .disabled)
+        let deletedID = credential.id
+        deleteCredentialPermanently(credential)
+        Task { await burnAndAdvance(completedID: deletedID) }
+    }
+
+    private func applyLocalTempDisabled(credential: Credential, password: String) {
+        captureAndRecord(credential: credential, password: password, status: .tempDisabled)
+        if rcrCurrentPasswords.count > 1 {
+            TempDisabledStore.shared.markDisabled(credentialID: credential.id)
+            showToast("Temp-disabled — \(credential.username) (1h cooldown)")
+        }
+        persistRCRProgress(completedID: credential.id)
+        rcrCompletedIDs.insert(credential.id)
+        rcrIndex += 1
+        rcrPasswordIndex = 0
+        Task { await runCurrentCredential() }
+    }
+
+    private func advanceAfterFailure() {
+        if rcrPasswordIndex + 1 < rcrCurrentPasswords.count {
+            rcrPasswordIndex += 1
+            Task { await attemptFill() }
+        } else if let credential = currentRCRCredential() {
+            persistRCRProgress(completedID: credential.id)
+            rcrCompletedIDs.insert(credential.id)
+            rcrIndex += 1
+            Task { await runCurrentCredential() }
+        }
+    }
+
+    private func judgeAndAdvance(payload: [String: Any], credentialID: String, password: String) async {
+        guard isRCRRunning else { return }
+        guard let credential = currentRCRCredential(), credential.id == credentialID else { return }
+        let webView = activeTab?.webView
+        let image = await WebViewSnapshotter.capture(webView)
+        let filename = image.flatMap { ScreenshotStorage.save($0) }
+        let domain = rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain
+        let decision = await SuccessJudgeEngine.judge(
+            payload: payload,
+            image: image,
+            domain: domain,
+            sessionTag: "single"
+        )
+        recordOutcome(
+            credential: credential,
+            password: password,
+            status: decision.status,
+            image: image,
+            filename: filename,
+            judge: decision
+        )
+
+        switch decision.status {
+        case .disabled:
+            applyLocalDisabled(credential: credential, password: password)
+        case .tempDisabled:
+            applyLocalTempDisabled(credential: credential, password: password)
+        case .failed, .pending, .skipped:
+            ParkedSessionStore.shared.recordFailure()
+            advanceAfterFailure()
+        case .review:
             persistRCRProgress(completedID: credential.id)
             rcrCompletedIDs.insert(credential.id)
             rcrIndex += 1
             rcrPasswordIndex = 0
             Task { await runCurrentCredential() }
-            return
-        }
-
-        // 3) Still on a login form → record as failed, try next password.
-        if hasPassword {
-            captureAndRecord(
-                credential: credential,
-                password: password,
-                status: .failed
-            )
-            if rcrPasswordIndex + 1 < rcrCurrentPasswords.count {
-                rcrPasswordIndex += 1
-                Task { await attemptFill() }
+        case .success:
+            let shouldPark = decision.shouldPark
+            persistRCRProgress(completedID: credential.id)
+            rcrCompletedIDs.insert(credential.id)
+            rcrIndex += 1
+            rcrPasswordIndex = 0
+            if shouldPark {
+                parkActiveTab(credential: credential, thumbnail: image)
+                if rcrIndex >= rcrTotal {
+                    stopRCR()
+                    return
+                }
+                rcrAwaitingNavigation = true
+                rcrStatus = .navigating
+                armRCRWatchdog()
             } else {
-                persistRCRProgress(completedID: credential.id)
-                rcrCompletedIDs.insert(credential.id)
-                rcrIndex += 1
                 Task { await runCurrentCredential() }
             }
         }
+    }
+
+    private func parkActiveTab(credential: Credential, thumbnail: UIImage?) {
+        guard let tab = activeTab else { return }
+        let storeID = tab.dataStoreID
+        _ = ParkedSessionStore.shared.park(
+            storeID: storeID,
+            url: tab.webView?.url ?? tab.url,
+            username: credential.username,
+            domain: rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain,
+            credentialID: credential.id,
+            sessionTag: "single",
+            thumbnail: thumbnail,
+            sourceWindowIndex: 0
+        )
+        tab.adoptFreshStore()
+        tab.url = rcrTargetURL
+    }
+
+    func restoreParkedSession(_ parked: ParkedSession) {
+        guard !isRCRRunning, !quadController.anyRCRRunning else {
+            showToast("Stop the run first", force: true)
+            return
+        }
+        if isQuadMode { setQuadMode(.single) }
+        sureLoginTask?.cancel()
+        let tab = BrowserTab(url: parked.url, dataStoreID: parked.storeUUID)
+        tabs.append(tab)
+        activeTabIndex = tabs.count - 1
+        urlBarText = parked.url?.absoluteString ?? ""
+        ParkedSessionStore.shared.detach(parked)
+        ParkedSessionStore.shared.isRailOpen = false
+    }
+
+    func sendParkedSession(_ parked: ParkedSession, toWindow index: Int) {
+        guard !isRCRRunning, !quadController.anyRCRRunning else {
+            showToast("Stop the run first", force: true)
+            return
+        }
+        if !isQuadMode {
+            setQuadMode(.grid(.four, dual: false))
+        }
+        guard index < quadController.activeCount else { return }
+        let session = quadController.sessions[index]
+        guard !session.rcrRunning, !session.isDisabled else {
+            showToast("That window is busy", force: true)
+            return
+        }
+        let oldID = session.storeID
+        session.storeID = parked.storeUUID
+        session.webViewGeneration += 1
+        session.url = parked.url
+        session.webView = nil
+        if !ParkedSessionStore.shared.contains(storeID: oldID) {
+            Task { await QuadDataStore.burn(dataStoreID: oldID) }
+        }
+        ParkedSessionStore.shared.detach(parked)
+        quadController.focusedIndex = index
+    }
+
+    func forgetParkedSession(_ parked: ParkedSession) {
+        Task { await ParkedSessionStore.shared.forget(parked) }
     }
 
     /// Deletes a permanently-disabled credential's keychain password and its
@@ -1747,6 +1851,34 @@ class BrowserViewModel {
     }
 
     // MARK: - Screenshot capture + record persistence
+
+    private func recordOutcome(
+        credential: Credential,
+        password: String,
+        status: AttemptRecord.Status,
+        image: UIImage?,
+        filename: String?,
+        judge: SuccessJudgeEngine.Decision?
+    ) {
+        guard let context = modelContext else { return }
+        let webView = activeTab?.webView
+        _ = AttemptTrackingService.shared.recordAttempt(
+            context: context,
+            credentialID: credential.id,
+            username: credential.username,
+            password: password,
+            passwordIndex: rcrPasswordIndex + 1,
+            passwordTotal: rcrCurrentPasswords.count,
+            targetDomain: rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain,
+            sessionTag: "single",
+            status: status,
+            resultURL: webView?.url?.absoluteString,
+            resultPageTitle: webView?.title,
+            screenshotFilename: filename,
+            judge: judge
+        )
+        let _ = image
+    }
 
     private func captureAndRecord(
         credential: Credential,

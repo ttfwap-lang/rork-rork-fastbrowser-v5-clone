@@ -2,6 +2,7 @@ import Foundation
 import SwiftData
 import OSLog
 import FoundationModels
+import UIKit
 
 /// Errors the router can surface. Deliberately terse — internal provider
 /// details are logged, never thrown upward.
@@ -202,6 +203,14 @@ final class IntelligenceCenter {
     /// escalating automatically on failure. Throws `allBrainsFailed` only
     /// after every configured brain has been tried.
     func ask(job: AIJob, system: String, user: String) async throws -> AIAnswer {
+        try await ask(job: job, system: system, user: user, imageJPEG: nil)
+    }
+
+    /// Same as `ask`, optionally attaching a JPEG screenshot. Passwords must
+    /// never be in the image or the prompt. Apple brains use native picture
+    /// input on an iOS 27 SDK build and fall back to the text prompt (which
+    /// already includes OCR) on the current toolchain.
+    func ask(job: AIJob, system: String, user: String, imageJPEG: Data?) async throws -> AIAnswer {
         refreshProviders()
         let order = Self.attemptOrder(
             preferred: preferredBrain(for: job),
@@ -214,13 +223,13 @@ final class IntelligenceCenter {
             do {
                 switch brain {
                 case .onDevice:
-                    let text = try await askApple(cloud: false, system: system, user: user)
+                    let text = try await askApple(cloud: false, system: system, user: user, imageJPEG: imageJPEG)
                     return AIAnswer(text: text, brain: brain, brainDetail: "On-device")
                 case .appleCloud:
-                    let text = try await askApple(cloud: true, system: system, user: user)
+                    let text = try await askApple(cloud: true, system: system, user: user, imageJPEG: imageJPEG)
                     return AIAnswer(text: text, brain: brain, brainDetail: "Apple Cloud")
                 case .byokKey:
-                    let (text, detail) = try await askBYOK(system: system, user: user)
+                    let (text, detail) = try await askBYOK(system: system, user: user, imageJPEG: imageJPEG)
                     return AIAnswer(text: text, brain: brain, brainDetail: detail)
                 }
             } catch {
@@ -235,14 +244,25 @@ final class IntelligenceCenter {
     /// Asks for a JSON reply and decodes it. On a malformed reply, retries
     /// once with a sharper instruction before failing over.
     func askJSON<T: Decodable>(job: AIJob, system: String, user: String, as type: T.Type) async throws -> (T, AIAnswer) {
-        var answer = try await ask(job: job, system: system + Self.jsonContract, user: user)
+        try await askJSON(job: job, system: system, user: user, imageJPEG: nil, as: type)
+    }
+
+    func askJSON<T: Decodable>(
+        job: AIJob,
+        system: String,
+        user: String,
+        imageJPEG: Data?,
+        as type: T.Type
+    ) async throws -> (T, AIAnswer) {
+        var answer = try await ask(job: job, system: system + Self.jsonContract, user: user, imageJPEG: imageJPEG)
         if let value = Self.decodeJSON(T.self, from: answer.text) {
             return (value, answer)
         }
         answer = try await ask(
             job: job,
             system: system + Self.jsonContract + "\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
-            user: user
+            user: user,
+            imageJPEG: imageJPEG
         )
         guard let value = Self.decodeJSON(T.self, from: answer.text) else {
             throw IntelligenceError.malformedReply
@@ -257,15 +277,27 @@ final class IntelligenceCenter {
 
     // MARK: - Apple brains (on-device + Private Cloud Compute)
 
-    private func askApple(cloud: Bool, system: String, user: String) async throws -> String {
+    private func askApple(cloud: Bool, system: String, user: String, imageJPEG: Data?) async throws -> String {
         if cloud {
             guard #available(iOS 27.0, *), appleCloudAvailable else {
                 throw IntelligenceError.brainUnavailable
             }
-            return try await AppleCloudBrain.respond(system: system, user: user)
+            return try await AppleCloudBrain.respond(system: system, user: user, imageJPEG: imageJPEG)
         }
         guard onDeviceAvailable else { throw IntelligenceError.brainUnavailable }
+        return try await respondOnDevice(system: system, user: user, imageJPEG: imageJPEG)
+    }
+
+    private func respondOnDevice(system: String, user: String, imageJPEG: Data?) async throws -> String {
         let session = LanguageModelSession(instructions: system)
+        #if FASTFILL_PCC_SDK
+        if #available(iOS 27.0, *), let imageJPEG, let image = UIImage(data: imageJPEG), let cg = image.cgImage {
+            return try await session.respond {
+                user
+                Attachment(cg)
+            }.content
+        }
+        #endif
         return try await session.respond(to: user).content
     }
 
@@ -274,7 +306,7 @@ final class IntelligenceCenter {
     /// Walks enabled providers in user order; within a provider, rotates key
     /// slots round-robin, skipping keys in cooldown. Rate-limit and 5xx
     /// responses cool the key for 2 minutes; unauthorized for 1 hour.
-    private func askBYOK(system: String, user: String) async throws -> (String, String) {
+    private func askBYOK(system: String, user: String, imageJPEG: Data? = nil) async throws -> (String, String) {
         guard hasUsableKeys else { throw IntelligenceError.noKeysConfigured }
         var lastError: Error = IntelligenceError.noKeysConfigured
 
@@ -296,6 +328,7 @@ final class IntelligenceCenter {
                     let text = try await client.chat(
                         system: system,
                         user: user,
+                        imageJPEG: imageJPEG,
                         endpoint: .init(baseURL: provider.baseURL, apiKey: apiKey, model: provider.modelName)
                     )
                     provider.rotationIndex = (slot + 1) % provider.keyCount
@@ -383,11 +416,24 @@ enum AppleCloudBrain {
         #if FASTFILL_PCC_SDK
         // Real Private Cloud Compute call. One-line model swap vs. the
         // on-device session — same unified FoundationModels API.
+        return try await respond(system: system, user: user, imageJPEG: nil)
+        #else
+        throw IntelligenceError.brainUnavailable
+        #endif
+    }
+
+    static func respond(system: String, user: String, imageJPEG: Data?) async throws -> String {
+        #if FASTFILL_PCC_SDK
         let session = LanguageModelSession(model: PrivateCloudComputeLanguageModel())
+        if let imageJPEG, let image = UIImage(data: imageJPEG), let cg = image.cgImage {
+            return try await session.respond {
+                system + "\n\n" + user
+                Attachment(cg)
+            }.content
+        }
         let combined = system + "\n\n" + user
         return try await session.respond(to: combined).content
         #else
-        // iOS 26 SDK: the PCC symbol isn't in this toolchain. Fail over.
         throw IntelligenceError.brainUnavailable
         #endif
     }

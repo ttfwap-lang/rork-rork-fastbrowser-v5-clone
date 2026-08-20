@@ -15,7 +15,8 @@ struct FastBrowserv4App: App {
             ExcludedDomain.self,
             AttemptRecord.self,
             AIProviderConfig.self,
-            AIRepairEvent.self
+            AIRepairEvent.self,
+            ParkedSession.self
         ])
     }
 }

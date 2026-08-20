@@ -235,7 +235,9 @@ private struct ResultRow: View {
 
             VStack(alignment: .trailing, spacing: 2) {
                 StatusBadge(status: record.status)
-                if let cat = record.ocrCategory, cat != "Unknown" {
+                if let verdict = record.judgeVerdict, !verdict.isEmpty {
+                    JudgeBadge(verdict: verdict)
+                } else if let cat = record.ocrCategory, cat != "Unknown" {
                     OcrBadge(category: cat)
                 }
             }
@@ -442,6 +444,7 @@ extension AttemptRecord.Status {
         case .disabled: return "Disabled"
         case .tempDisabled: return "Temp"
         case .skipped: return "Skipped"
+        case .review: return "Review"
         }
     }
 
@@ -453,6 +456,41 @@ extension AttemptRecord.Status {
         case .disabled: return .orange
         case .tempDisabled: return .pink
         case .skipped: return .secondary
+        case .review: return .orange
         }
+    }
+}
+
+struct JudgeBadge: View {
+    let verdict: String
+
+    var color: Color {
+        switch verdict {
+        case "confirmed": return .green
+        case "review": return .orange
+        case "failed", "disabled": return .secondary
+        default: return .cyan
+        }
+    }
+
+    var label: String {
+        switch verdict {
+        case "confirmed": return "CONFIRMED"
+        case "review": return "REVIEW"
+        case "failed": return "FAILED"
+        case "disabled": return "DISABLED"
+        case "local": return "LOCAL"
+        default: return verdict.uppercased()
+        }
+    }
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 8, weight: .heavy))
+            .kerning(0.4)
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(color.opacity(0.15)))
     }
 }

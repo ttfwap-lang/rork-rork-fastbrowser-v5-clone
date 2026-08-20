@@ -274,6 +274,7 @@ struct QuadBrowserView: View {
         return AnyView(
             ZStack {
                 QuadCellWebView(session: session, controller: controller)
+                    .id("\(session.index)-\(session.storeID.uuidString)-\(session.webViewGeneration)")
 
                 // Top-left badge with session id and status dot.
                 VStack {

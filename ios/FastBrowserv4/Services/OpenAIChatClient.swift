@@ -75,7 +75,27 @@ nonisolated struct OpenAIChatClient: Sendable {
     }
 
     private struct ChatRequest: Encodable {
-        struct Message: Encodable { let role: String; let content: String }
+        struct ImageURL: Encodable { let url: String }
+        struct ContentPart: Encodable {
+            let type: String
+            let text: String?
+            let image_url: ImageURL?
+        }
+        enum MessageContent: Encodable {
+            case text(String)
+            case parts([ContentPart])
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.singleValueContainer()
+                switch self {
+                case .text(let text): try container.encode(text)
+                case .parts(let parts): try container.encode(parts)
+                }
+            }
+        }
+        struct Message: Encodable {
+            let role: String
+            let content: MessageContent
+        }
         let model: String
         let messages: [Message]
         let temperature: Double
@@ -86,17 +106,34 @@ nonisolated struct OpenAIChatClient: Sendable {
     /// behavioral contract; `user` the payload. Never throws raw provider
     /// bodies — errors are sanitized by `LLMClientError`.
     func chat(system: String, user: String, endpoint: Endpoint) async throws -> String {
+        try await chat(system: system, user: user, imageJPEG: nil, endpoint: endpoint)
+    }
+
+    /// Same as `chat`, optionally attaching a JPEG as a multimodal part.
+    /// The image is expected to be a page screenshot — never a password.
+    func chat(system: String, user: String, imageJPEG: Data?, endpoint: Endpoint) async throws -> String {
         let url = try chatCompletionsURL(for: endpoint.baseURL)
         var request = URLRequest(url: url, timeoutInterval: ClientConfig.requestTimeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(endpoint.apiKey)", forHTTPHeaderField: "Authorization")
 
+        let userContent: ChatRequest.MessageContent
+        if let imageJPEG {
+            let dataURL = "data:image/jpeg;base64," + imageJPEG.base64EncodedString()
+            userContent = .parts([
+                .init(type: "text", text: user, image_url: nil),
+                .init(type: "image_url", text: nil, image_url: .init(url: dataURL))
+            ])
+        } else {
+            userContent = .text(user)
+        }
+
         let body = ChatRequest(
             model: endpoint.model,
             messages: [
-                .init(role: "system", content: system),
-                .init(role: "user", content: user)
+                .init(role: "system", content: .text(system)),
+                .init(role: "user", content: userContent)
             ],
             temperature: 0.1,
             max_tokens: ClientConfig.maxTokens

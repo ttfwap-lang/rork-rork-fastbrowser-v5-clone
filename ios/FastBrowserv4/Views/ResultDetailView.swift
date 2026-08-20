@@ -35,6 +35,18 @@ struct ResultDetailView: View {
                     detailRow("Password", "\(record.passwordIndex) of \(record.passwordTotal)")
                     detailRow("Session", record.sessionTag.uppercased())
                     detailRow("Status", record.status.label, valueColor: record.status.color)
+                    if let verdict = record.judgeVerdict, !verdict.isEmpty {
+                        detailRow("Judge", verdict.capitalized, valueColor: JudgeBadge(verdict: verdict).color)
+                    }
+                    if record.judgeConfidence > 0 {
+                        detailRow("Confidence", "\(Int((record.judgeConfidence * 100).rounded()))%")
+                    }
+                    if let reason = record.judgeReason, !reason.isEmpty {
+                        detailRow("Reason", reason)
+                    }
+                    if let brain = record.judgeBrain, !brain.isEmpty, brain != "—" {
+                        detailRow("Brain", brain)
+                    }
                     detailRow("When", record.timestamp.formatted(date: .abbreviated, time: .standard))
                     if let title = record.resultPageTitle, !title.isEmpty {
                         detailRow("Page Title", title)

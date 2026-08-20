@@ -36,6 +36,16 @@ final class AttemptRecord {
     /// OCR-detected category from the post-submit screenshot — "success",
     /// "failure", "captcha", "locked", "unknown", or nil if not yet analysed.
     var ocrCategory: String?
+    /// Judge verdict: "confirmed", "review", "failed", "disabled", "local".
+    var judgeVerdict: String?
+    /// 0...1 confidence from the local cascade or the AI.
+    var judgeConfidence: Double
+    /// Short plain-English reason shown in Results.
+    var judgeReason: String?
+    /// "local", "ocr", "ai", or "vision".
+    var judgeSource: String?
+    /// Which brain produced the verdict, or "—" for local-only.
+    var judgeBrain: String?
 
     var status: Status {
         get { Status(rawValue: statusRaw) ?? .pending }
@@ -49,6 +59,8 @@ final class AttemptRecord {
         case disabled
         case tempDisabled
         case skipped
+        /// Borderline success — shown amber, never parked.
+        case review
     }
 
     init(
@@ -72,5 +84,10 @@ final class AttemptRecord {
         self.statusRaw = status.rawValue
         self.timestamp = Date()
         self.ocrCategory = nil
+        self.judgeVerdict = nil
+        self.judgeConfidence = 0
+        self.judgeReason = nil
+        self.judgeSource = nil
+        self.judgeBrain = nil
     }
 }

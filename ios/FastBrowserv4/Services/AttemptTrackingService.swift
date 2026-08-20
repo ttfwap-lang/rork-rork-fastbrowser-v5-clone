@@ -24,7 +24,7 @@ final class AttemptTrackingService {
                 rec.credentialID == credentialID
                     && rec.passwordHash == passwordHash
                     && rec.targetDomain == targetDomain
-                    && (rec.statusRaw == "success" || rec.statusRaw == "disabled")
+                    && (rec.statusRaw == "success" || rec.statusRaw == "disabled" || rec.statusRaw == "review")
             }
         )
         return ((try? context.fetch(descriptor).first) != nil)
@@ -44,7 +44,7 @@ final class AttemptTrackingService {
             predicate: #Predicate<AttemptRecord> { rec in
                 rec.credentialID == credentialID
                     && rec.targetDomain == targetDomain
-                    && rec.statusRaw == "success"
+                    && (rec.statusRaw == "success" || rec.statusRaw == "review")
             }
         )
         if (try? context.fetch(successDescriptor).first) != nil { return true }
@@ -78,7 +78,8 @@ final class AttemptTrackingService {
         status: AttemptRecord.Status,
         resultURL: String? = nil,
         resultPageTitle: String? = nil,
-        screenshotFilename: String? = nil
+        screenshotFilename: String? = nil,
+        judge: SuccessJudgeEngine.Decision? = nil
     ) -> AttemptRecord {
         let hash = PasswordFingerprint.hash(password)
         let descriptor = FetchDescriptor<AttemptRecord>(
@@ -103,6 +104,7 @@ final class AttemptTrackingService {
                 }
                 existing.screenshotFilename = screenshotFilename
             }
+            if let judge { apply(judge, to: existing) }
             try? context.save()
             return existing
         }
@@ -120,9 +122,19 @@ final class AttemptTrackingService {
         record.resultURL = resultURL
         record.resultPageTitle = resultPageTitle
         record.screenshotFilename = screenshotFilename
+        if let judge { apply(judge, to: record) }
         context.insert(record)
         try? context.save()
         return record
+    }
+
+    private func apply(_ judge: SuccessJudgeEngine.Decision, to record: AttemptRecord) {
+        record.judgeVerdict = judge.verdict
+        record.judgeConfidence = judge.confidence
+        record.judgeReason = judge.reason
+        record.judgeSource = judge.source
+        record.judgeBrain = judge.brain
+        if let ocr = judge.ocrCategory { record.ocrCategory = ocr }
     }
 
     /// Returns the count of distinct password fingerprints attempted for

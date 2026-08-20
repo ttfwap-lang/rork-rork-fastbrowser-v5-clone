@@ -109,6 +109,11 @@ final class FillHealerEngine {
         budget.removeAll()
     }
 
+    /// How many heals have been spent on this domain in the current run.
+    func usedHeals(for domain: String) -> Int {
+        budget[domain.lowercased(), default: 0]
+    }
+
     var isEnabled: Bool {
         UserDefaults.standard.object(forKey: "aiHealerEnabled") as? Bool ?? true
     }

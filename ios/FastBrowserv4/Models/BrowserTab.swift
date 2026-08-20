@@ -9,7 +9,10 @@ class BrowserTab: Identifiable {
     /// Persistent WebKit data-store identity for this tab. Cookies, cache,
     /// localStorage and IndexedDB stay isolated from every other tab and
     /// every multi-window cell.
-    let dataStoreID: UUID
+    var dataStoreID: UUID
+    /// Bumped when the tab adopts a new isolated store so SwiftUI rebuilds
+    /// the `WKWebView` (configuration is immutable after creation).
+    var webViewGeneration: Int
     var url: URL?
     var title: String
     var isLoading: Bool
@@ -27,6 +30,7 @@ class BrowserTab: Identifiable {
     init(url: URL? = nil, dataStoreID: UUID = UUID()) {
         self.id = UUID().uuidString
         self.dataStoreID = dataStoreID
+        self.webViewGeneration = 0
         self.url = url
         self.title = "New Tab"
         self.isLoading = false
@@ -43,6 +47,14 @@ class BrowserTab: Identifiable {
 
     var displayURL: String {
         url?.absoluteString ?? ""
+    }
+
+    /// Hands this tab a brand-new isolated store. The previous store is
+    /// left untouched — callers park or burn it themselves.
+    func adoptFreshStore() {
+        dataStoreID = UUID()
+        webViewGeneration += 1
+        webView = nil
     }
 
     func captureSnapshot() {

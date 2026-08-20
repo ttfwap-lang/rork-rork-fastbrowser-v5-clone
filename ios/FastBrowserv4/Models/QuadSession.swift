@@ -19,7 +19,10 @@ final class QuadSession: Identifiable {
 
     let id: String
     let index: Int
-    let storeID: UUID
+    var storeID: UUID
+    /// Bumped when this cell adopts a new isolated store so the web view
+    /// is recreated against the new cookie jar.
+    var webViewGeneration: Int = 0
     /// Browser target assignment. Recalculated from the active layout and
     /// split pattern whenever the grid or dual-site pattern changes.
     var targetSiteIndex: Int
@@ -67,6 +70,8 @@ final class QuadSession: Identifiable {
     /// True while the runner is performing the configured extra submits.
     /// All other RCR actions are paused until this clears.
     var rcrExtraSubmitsInFlight: Bool = false
+    /// True while the success cascade is capturing / asking the AI.
+    var rcrJudging: Bool = false
     /// Set when this window just burned a perm-disabled session. The next
     /// navigation must wait for page boot + cookie consent before filling.
     var needsPostBurnSettle: Bool = false
@@ -80,6 +85,14 @@ final class QuadSession: Identifiable {
         self.id = "S\(index + 1)"
         self.storeID = QuadDataStore.identifier(for: index)
         self.targetSiteIndex = index % 2
+    }
+
+    /// Hands this cell a brand-new isolated store. The previous store is
+    /// left untouched — callers park or burn it themselves.
+    func adoptFreshStore() {
+        storeID = UUID()
+        webViewGeneration += 1
+        webView = nil
     }
 
     var sessionTag: String { id }

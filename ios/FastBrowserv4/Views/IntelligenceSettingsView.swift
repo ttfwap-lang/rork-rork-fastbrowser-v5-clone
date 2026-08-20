@@ -9,8 +9,13 @@ struct IntelligenceSettingsView: View {
     @Query(sort: [SortDescriptor(\AIRepairEvent.timestamp, order: .reverse)]) private var events: [AIRepairEvent]
 
     @State private var center = IntelligenceCenter.shared
+    @State private var parked = ParkedSessionStore.shared
     @State private var isAddingProvider: Bool = false
     @State private var routeTick: Int = 0
+    @AppStorage("aiHealerEnabled") private var healerEnabled: Bool = true
+    @AppStorage("aiSuccessDetectionMode") private var detectionModeRaw: String = SuccessJudgeEngine.DetectionMode.localAndAI.rawValue
+    @AppStorage("aiVisionConsentGranted") private var visionConsent: Bool = false
+    @State private var showClearParked: Bool = false
 
     var body: some View {
         Form {
@@ -42,6 +47,20 @@ struct IntelligenceSettingsView: View {
                 Text("Brains")
             } footer: {
                 Text("Jobs try your chosen brain first and fall over automatically if it's unavailable. Passwords and field contents are never sent to any AI — only page structure and visible text.")
+            }
+
+            Section {
+                Toggle("Auto-repair stuck fills", isOn: $healerEnabled)
+                Picker("Success detection", selection: $detectionModeRaw) {
+                    ForEach(SuccessJudgeEngine.DetectionMode.allCases) { mode in
+                        Text(mode.label).tag(mode.rawValue)
+                    }
+                }
+                Toggle("Allow screenshot judgement", isOn: $visionConsent)
+            } header: {
+                Text("Behaviour")
+            } footer: {
+                Text(visionConsentFooter)
             }
 
             Section {
@@ -134,6 +153,18 @@ struct IntelligenceSettingsView: View {
             } footer: {
                 Text("Every repair and verdict the AI makes, in plain English.")
             }
+
+            Section {
+                LabeledContent("Parked sessions", value: "\(parked.sessions.count)")
+                Button("Clear All Parked", role: .destructive) {
+                    showClearParked = true
+                }
+                .disabled(parked.sessions.isEmpty)
+            } header: {
+                Text("Parked Sessions")
+            } footer: {
+                Text("Clearing parked sessions closes them and wipes each isolated cookie store. The vault is not touched.")
+            }
         }
         .navigationTitle("Intelligence")
         .navigationBarTitleDisplayMode(.inline)
@@ -150,6 +181,25 @@ struct IntelligenceSettingsView: View {
         .sheet(isPresented: $isAddingProvider) {
             NavigationStack { AddAIProviderView() }
         }
+        .confirmationDialog(
+            "Clear all parked sessions?",
+            isPresented: $showClearParked,
+            titleVisibility: .visible
+        ) {
+            Button("Clear All Parked", role: .destructive) {
+                Task { await parked.clearAll() }
+            }
+        } message: {
+            Text("Closes every parked login and wipes that session's cookies. This cannot be undone.")
+        }
+    }
+
+    private var visionConsentFooter: String {
+        let provider = center.providers.first(where: { $0.keyCount > 0 })?.displayName ?? "your API provider"
+        if visionConsent {
+            return "On unclear pages only, a screenshot of the page (never passwords) may be sent to \(provider) for a picture-based judgement."
+        }
+        return "Turn this on to let \(provider) see a screenshot of an unclear page. Passwords are never included. Off by default."
     }
 
     private func brainRow(icon: String, tint: Color, title: String, note: String, isReady: Bool) -> some View {
