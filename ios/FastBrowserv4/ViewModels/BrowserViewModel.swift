@@ -1199,6 +1199,9 @@ class BrowserViewModel {
             JavaScriptInjectionService.rcrScrollEnableScript(),
             completionHandler: nil
         )
+        // Fresh run → fresh healer retry budget, so a site that hit its
+        // per-domain repair cap on a previous run is eligible again.
+        FillHealerEngine.shared.resetRunBudget()
         isRCRRunning = true
         rcrStatus = .navigating
         Task { await runCurrentCredential() }
@@ -1400,10 +1403,11 @@ class BrowserViewModel {
         // Self-healing (Part 3): if the generic selectors missed a field,
         // ask the AI to repair them — verified and bounded, never on
         // captcha/lockout pages.
+        var healedSubmitSelector: String? = nil
         if FillHealerEngine.fillMissed(fillResult),
            let webView = activeTab?.webView,
            let context = self.modelContext {
-            _ = await FillHealerEngine.shared.healAndRefill(
+            let outcome = await FillHealerEngine.shared.healAndRefill(
                 webView: webView,
                 domain: targetDomain,
                 sessionTag: "single",
@@ -1411,11 +1415,14 @@ class BrowserViewModel {
                 password: password,
                 modelContext: context
             )
+            healedSubmitSelector = outcome?.submitSelector
         }
 
         rcrStatus = .submitting
+        // A submit control the healer just verified beats the stored one on
+        // this very attempt, not just the next visit.
         let submitScript = JavaScriptInjectionService.submitFormScript(
-            submitSelector: siteSetting?.submitButtonSelector
+            submitSelector: healedSubmitSelector ?? siteSetting?.submitButtonSelector
         )
         _ = try? await activeTab?.webView?.evaluateJavaScript(submitScript)
 

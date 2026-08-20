@@ -133,14 +133,28 @@ final class IntelligenceCenter {
             onDeviceNote = Self.reasonText(reason)
         }
 
-        // Private Cloud Compute is iOS 27-only and this build toolchain
-        // currently ships the iOS 26 SDK, where the symbol doesn't exist.
-        // The brain stays in the routing table and simply reports
-        // unavailable, so jobs fall back automatically; as soon as the app
-        // is compiled against the iOS 27 SDK, flip `pccCompiledIn` to the
-        // real implementation below.
-        appleCloudAvailable = false
-        appleCloudNote = "Requires the iOS 27 SDK — activates automatically when available"
+        // Private Cloud Compute is real on iOS 27. It needs Apple
+        // Intelligence (same device/region prerequisite as the on-device
+        // model) plus a network connection and the managed PCC entitlement.
+        // The full integration lives in `AppleCloudBrain`, compiled in behind
+        // FASTFILL_PCC_SDK (defined only when the toolchain has the iOS 27
+        // SDK — see project.pbxproj). On the current iOS 26 SDK the symbol
+        // doesn't exist, so the brain reports honestly and the router falls
+        // over to on-device / your keys instead of pretending.
+        if #available(iOS 27.0, *) {
+            #if FASTFILL_PCC_SDK
+            appleCloudAvailable = onDeviceAvailable
+            appleCloudNote = onDeviceAvailable
+                ? "Ready — Apple's server model"
+                : "Needs Apple Intelligence turned on"
+            #else
+            appleCloudAvailable = false
+            appleCloudNote = "Activates on an iOS 27 build"
+            #endif
+        } else {
+            appleCloudAvailable = false
+            appleCloudNote = "Requires iOS 27"
+        }
     }
 
     private static func reasonText(_ reason: Any) -> String {
@@ -245,10 +259,10 @@ final class IntelligenceCenter {
 
     private func askApple(cloud: Bool, system: String, user: String) async throws -> String {
         if cloud {
-            // See refreshAvailability() — PCC compiles in only with the
-            // iOS 27 SDK. Until then this brain never serves and the router
-            // falls through to the next candidate.
-            throw IntelligenceError.brainUnavailable
+            guard #available(iOS 27.0, *), appleCloudAvailable else {
+                throw IntelligenceError.brainUnavailable
+            }
+            return try await AppleCloudBrain.respond(system: system, user: user)
         }
         guard onDeviceAvailable else { throw IntelligenceError.brainUnavailable }
         let session = LanguageModelSession(instructions: system)
@@ -356,5 +370,25 @@ final class IntelligenceCenter {
             succeeded: succeeded
         ))
         try? modelContext.save()
+    }
+}
+
+/// Real Apple Private Cloud Compute integration (iOS 27+). Isolated in its
+/// own availability-gated type so the rest of the app compiles on iOS 26 and
+/// this brain activates automatically for iOS 27 users on a build made with
+/// the iOS 27 SDK.
+@available(iOS 27.0, *)
+enum AppleCloudBrain {
+    static func respond(system: String, user: String) async throws -> String {
+        #if FASTFILL_PCC_SDK
+        // Real Private Cloud Compute call. One-line model swap vs. the
+        // on-device session — same unified FoundationModels API.
+        let session = LanguageModelSession(model: PrivateCloudComputeLanguageModel())
+        let combined = system + "\n\n" + user
+        return try await session.respond(to: combined).content
+        #else
+        // iOS 26 SDK: the PCC symbol isn't in this toolchain. Fail over.
+        throw IntelligenceError.brainUnavailable
+        #endif
     }
 }
