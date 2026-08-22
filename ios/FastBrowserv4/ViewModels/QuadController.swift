@@ -29,6 +29,13 @@ final class QuadController {
     /// When `true`, sessions retry passwords that previously came back as
     /// `failed`. `success` and `disabled` results are always skipped.
     var retryFailed: Bool = false
+    /// True while every window rests between attempts (pause-all).
+    private(set) var isQuadRCRPaused: Bool = false
+    /// One continuation per frozen window index, resolved on thaw.
+    private var freezeContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
+    /// Every window suspended by pause-all — pause-all suspends multiple
+    /// runners at once, so one continuation per waiting window.
+    private var quadPauseContinuations: [CheckedContinuation<Void, Never>] = []
     /// Per-lane completed-credential counters for dual-site mode, sized to
     /// the active lane count whenever a dual-site run starts. Powers the
     /// compact summary bar shown on the larger grids.
@@ -99,12 +106,6 @@ final class QuadController {
     /// B side). Valid for `lane` in `0..<laneCount`.
     func lanePair(_ lane: Int) -> (QuadSession, QuadSession) {
         (sessionA(forLane: lane), sessionB(forLane: lane))
-    }
-
-    func navigateFocused(to url: URL) {
-        let s = focusedSession
-        s.url = url
-        s.webView?.load(URLRequest(url: url))
     }
 
     func navigateAll(to url: URL) {
@@ -478,6 +479,15 @@ final class QuadController {
         // Invalidate any in-flight start preflight.
         isStartingRCR = false
         rcrStartGeneration &+= 1
+        // Wake every suspended runner so nothing hangs on a continuation.
+        isQuadRCRPaused = false
+        for continuation in quadPauseContinuations { continuation.resume() }
+        quadPauseContinuations = []
+        for (index, continuation) in freezeContinuations {
+            continuation.resume()
+            sessions[index].isRCRFrozen = false
+        }
+        freezeContinuations = [:]
         for s in enabledSessions where s.rcrRunning {
             s.rcrRunning = false
             s.rcrStatus = .idle
@@ -495,6 +505,7 @@ final class QuadController {
             s.rcrWatchdog = nil
             // Don't leave plaintext passwords sitting in memory after a stop.
             s.rcrPasswords = []
+            s.rcrPasswordsCredentialID = ""
             s.webView?.evaluateJavaScript(
                 JavaScriptInjectionService.rcrScrollDisableScript(),
                 completionHandler: nil
@@ -515,7 +526,168 @@ final class QuadController {
         return try? context.fetch(descriptor).first
     }
 
+    // MARK: - Grid cockpit (pause-all / freeze / skip / retry / speed)
+
+    /// The live speed profile — shared with single-window mode through the
+    /// host browser so the dial stays consistent across modes.
+    var activeSpeedProfile: SpeedProfile {
+        browserViewModel?.runSpeedProfile ?? SpeedProfile.saved
+    }
+
+    /// Pauses or resumes every running window between attempts. The
+    /// in-flight attempt always completes.
+    func setQuadRCRPaused(_ paused: Bool) {
+        guard anyRCRRunning, paused != isQuadRCRPaused else { return }
+        isQuadRCRPaused = paused
+        if paused {
+            for s in activeSessions { cancelRCRWatchdog(for: s) }
+            browserViewModel?.showToast("All windows paused")
+        } else {
+            for continuation in quadPauseContinuations { continuation.resume() }
+            quadPauseContinuations = []
+            for s in activeSessions where s.rcrRunning
+                && (s.rcrStatus == .waiting || s.rcrStatus == .navigating) {
+                armRCRWatchdog(for: s)
+            }
+            browserViewModel?.showToast("Run resumed")
+        }
+    }
+
+    func toggleQuadRCRPause() {
+        setQuadRCRPaused(!isQuadRCRPaused)
+    }
+
+    /// Freezes or thaws one window. Frozen windows rest between attempts
+    /// while the rest of the grid keeps working.
+    func setSessionFrozen(_ s: QuadSession, _ frozen: Bool) {
+        guard frozen != s.isRCRFrozen else { return }
+        s.isRCRFrozen = frozen
+        if frozen {
+            cancelRCRWatchdog(for: s)
+            browserViewModel?.showToast("\(s.id) frozen — rests between attempts")
+        } else {
+            freezeContinuations[s.index]?.resume()
+            freezeContinuations[s.index] = nil
+            if s.rcrRunning, s.rcrStatus == .waiting || s.rcrStatus == .navigating {
+                armRCRWatchdog(for: s)
+            }
+            browserViewModel?.showToast("\(s.id) thawed")
+        }
+    }
+
+    func toggleSessionFrozen(_ s: QuadSession) {
+        setSessionFrozen(s, !s.isRCRFrozen)
+    }
+
+    /// Suspends a session's runner while pause-all is on or the window is
+    /// frozen. Every async leg of a session's run passes through here.
+    private func waitIfPausedOrFrozen(_ s: QuadSession) async {
+        if isQuadRCRPaused {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                quadPauseContinuations.append(continuation)
+            }
+        }
+        if s.isRCRFrozen {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                freezeContinuations[s.index] = continuation
+            }
+        }
+    }
+
+    /// Skips the current credential in one window: records it as skipped
+    /// with a reason and moves that window's run on. In dual-site mode the
+    /// skip finishes this window's side of the lane so the pairing stays
+    /// in sync.
+    func skipCurrentForSession(_ s: QuadSession) {
+        guard s.rcrRunning, s.rcrIndex < s.rcrQueueIDs.count else { return }
+        cancelRCRWatchdog(for: s)
+        s.rcrJudging = false
+        s.rcrExtraSubmitsInFlight = false
+        s.rcrAttemptGeneration &+= 1
+        if dualQuadActive {
+            let lane = laneIndex(for: s)
+            guard let credential = currentDualCredential(s) else { return }
+            if let context = modelContext {
+                let password = s.rcrPasswords[safe: s.rcrPasswordIndex] ?? ""
+                _ = AttemptTrackingService.shared.recordAttempt(
+                    context: context,
+                    credentialID: credential.id,
+                    username: credential.username,
+                    password: password,
+                    passwordIndex: s.rcrPasswordIndex + 1,
+                    passwordTotal: s.rcrPasswords.count,
+                    targetDomain: s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain,
+                    sessionTag: s.sessionTag,
+                    status: .skipped,
+                    judge: SuccessJudgeEngine.Decision.local(
+                        status: .skipped,
+                        verdict: "skipped",
+                        confidence: 1,
+                        reason: "Skipped by you during the run"
+                    )
+                )
+            }
+            browserViewModel?.showToast("Skipped \(credential.username) (\(s.id))")
+            finishDualSide(session: s, lane: lane, status: .skipped)
+            return
+        }
+        guard let credential = currentCredential(s) else { return }
+        let password = s.rcrPasswords[safe: s.rcrPasswordIndex] ?? ""
+        if let context = modelContext {
+            _ = AttemptTrackingService.shared.recordAttempt(
+                context: context,
+                credentialID: credential.id,
+                username: credential.username,
+                password: password,
+                passwordIndex: s.rcrPasswordIndex + 1,
+                passwordTotal: s.rcrPasswords.count,
+                targetDomain: s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain,
+                sessionTag: s.sessionTag,
+                status: .skipped,
+                judge: SuccessJudgeEngine.Decision.local(
+                    status: .skipped,
+                    verdict: "skipped",
+                    confidence: 1,
+                    reason: "Skipped by you during the run"
+                )
+            )
+        }
+        browserViewModel?.showToast("Skipped \(credential.username) (\(s.id))")
+        s.rcrCompletedIDs.insert(credential.id)
+        s.rcrIndex += 1
+        s.rcrPasswordIndex = 0
+        s.rcrPasswords = []
+        s.rcrPasswordsCredentialID = ""
+        Task { await runCurrent(session: s) }
+    }
+
+    /// Re-fills and re-submits the password a window just tried.
+    func retryCurrentForSession(_ s: QuadSession) {
+        guard s.rcrRunning, !s.rcrPasswords.isEmpty,
+              s.rcrPasswordIndex < s.rcrPasswords.count else { return }
+        guard !s.rcrJudging else {
+            browserViewModel?.showToast("Judging the current attempt — retry in a moment", force: true)
+            return
+        }
+        guard s.rcrStatus == .waiting || s.rcrStatus == .submitting else {
+            browserViewModel?.showToast("Retry is available while watching a submit", force: true)
+            return
+        }
+        cancelRCRWatchdog(for: s)
+        s.rcrJudging = false
+        s.rcrExtraSubmitsInFlight = false
+        s.rcrAttemptGeneration &+= 1
+        browserViewModel?.showToast("Retrying \(s.rcrCurrentUsername) (\(s.id))")
+        if dualQuadActive {
+            Task { await attemptFillDual(session: s, lane: laneIndex(for: s)) }
+        } else {
+            Task { await attemptFill(session: s) }
+        }
+    }
+
     private func runCurrent(session s: QuadSession) async {
+        guard s.rcrRunning else { return }
+        await waitIfPausedOrFrozen(s)
         guard s.rcrRunning else { return }
         // Skip credentials in temp-disabled cooldown OR ever perma-disabled.
         while s.rcrIndex < s.rcrQueueIDs.count {
@@ -598,6 +770,7 @@ final class QuadController {
 
         s.rcrPasswords = filtered
         s.rcrPasswordIndex = 0
+        s.rcrPasswordsCredentialID = credential.id
         s.rcrCurrentUsername = credential.username
         if let target = s.rcrTargetURL {
             s.rcrCurrentDomain = target.host(percentEncoded: false) ?? credential.domain
@@ -620,16 +793,18 @@ final class QuadController {
 
     // MARK: - Per-attempt watchdog
 
-    private static let rcrWatchdogTimeout: Duration = .seconds(12)
+    private static let rcrWatchdogTimeout: Duration = PageSettleService.attemptWatchdog
 
     /// Arms the per-attempt watchdog. If the page produces no state message
     /// within the timeout (navigation failure, dead page, wedged web
     /// process), the attempt is recorded as failed and the run advances —
-    /// previously the session sat in "watching" forever.
+    /// previously the session sat in "watching" forever. Stretched by the
+    /// speed profile, never shrunk below base.
     private func armRCRWatchdog(for s: QuadSession, timeout: Duration = rcrWatchdogTimeout) {
+        let effective = SpeedProfile.effectiveWatchdog(timeout, profile: activeSpeedProfile)
         s.rcrWatchdog?.cancel()
         s.rcrWatchdog = Task { [weak self, weak s] in
-            try? await Task.sleep(for: timeout)
+            try? await Task.sleep(for: effective)
             guard let self, let s, !Task.isCancelled else { return }
             self.rcrWatchdogFired(session: s)
         }
@@ -642,6 +817,9 @@ final class QuadController {
 
     private func rcrWatchdogFired(session s: QuadSession) {
         guard s.rcrRunning, s.rcrStatus == .waiting || s.rcrStatus == .navigating else { return }
+        // Paused or frozen windows must never be advanced by their own
+        // watchdog — re-arm and wait.
+        guard !isQuadRCRPaused, !s.isRCRFrozen else { armRCRWatchdog(for: s); return }
         s.rcrAwaitingNavigation = false
 
         if dualQuadActive {
@@ -682,9 +860,20 @@ final class QuadController {
     }
 
     private func attemptFill(session s: QuadSession) async {
-        guard s.rcrRunning, !s.rcrPasswords.isEmpty else { return }
+        guard s.rcrRunning else { return }
+        await waitIfPausedOrFrozen(s)
+        guard s.rcrRunning else { return }
         guard let credential = currentCredential(s) else {
             s.rcrIndex += 1
+            await runCurrent(session: s)
+            return
+        }
+        // Cross-credential guard: the in-memory password list must belong
+        // to THIS credential. After a park or burn the list still holds the
+        // previous credential's passwords — rebuild instead of filling the
+        // wrong account's secrets.
+        guard s.rcrPasswordsCredentialID == credential.id, !s.rcrPasswords.isEmpty else {
+            s.rcrPasswords = []
             await runCurrent(session: s)
             return
         }
@@ -728,7 +917,8 @@ final class QuadController {
         // temp-disable, or success stops further submits immediately.
         let extraCount = max(0, UserDefaults.standard.integer(forKey: "rcrExtraSubmits"))
         let rawDelay = UserDefaults.standard.double(forKey: "rcrSubmitDelay")
-        let delay = rawDelay > 0 ? rawDelay : 1.5
+        let baseDelay = rawDelay > 0 ? rawDelay : 1.5
+        let delay = max(0.2, baseDelay * activeSpeedProfile.submitGapMultiplier)
         if extraCount > 0 {
             // The extra-submit loop is self-driving (state check after every
             // submit) and can legitimately run for ~50s — the watchdog must
@@ -736,6 +926,8 @@ final class QuadController {
             cancelRCRWatchdog(for: s)
             s.rcrExtraSubmitsInFlight = true
             for _ in 0..<extraCount {
+                await waitIfPausedOrFrozen(s)
+                guard s.rcrRunning else { s.rcrExtraSubmitsInFlight = false; return }
                 try? await Task.sleep(for: .seconds(delay))
                 guard s.rcrRunning else { s.rcrExtraSubmitsInFlight = false; return }
                 _ = try? await s.webView?.evaluateJavaScript(submitScript)
@@ -862,6 +1054,10 @@ final class QuadController {
     ) async {
         guard s.rcrRunning else { return }
         guard let credential = currentCredential(s), credential.id == credentialID else { return }
+        // Speed-scaled grace before judging so the page settles into its
+        // final state — slower profiles judge later, never sooner.
+        try? await Task.sleep(for: activeSpeedProfile.judgeGrace)
+        guard s.rcrRunning else { return }
         let image = await WebViewSnapshotter.capture(s.webView)
         let filename = image.flatMap { ScreenshotStorage.save($0) }
         let domain = s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain
@@ -1019,14 +1215,31 @@ final class QuadController {
     }
 
     /// After a navigation finishes: wait for cookie/consent (and, after a
-    /// burn, extra page-boot + login-form time) then start the fill.
+    /// burn, extra page-boot + login-form time) then start the fill. Also
+    /// applies the site-smart pacing pause (learned settle, scaled by the
+    /// live speed profile, plus a brief human-like pre-fill pause).
     private func settleThenFill(session s: QuadSession) async {
         let extra = s.needsPostBurnSettle
         s.needsPostBurnSettle = false
+        let settleStart = Date()
         await waitForCookieNoticeIfNeeded(session: s, extraBoot: extra)
         guard s.rcrRunning else { return }
         if extra, let webView = s.webView {
             await PageSettleService.waitForLoginForm(in: webView)
+            guard s.rcrRunning else { return }
+        }
+        // Learn how long this site really took to settle (bounded EMA),
+        // then rest for the profile-scaled learned time before filling.
+        let domain = s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? ""
+        if !domain.isEmpty {
+            let observed = Date().timeIntervalSince(settleStart)
+            SitePacingStore.shared.recordSettle(seconds: observed, domain: domain)
+            let learned = SitePacingStore.shared.settleSeconds(for: domain)
+            let scaled = SpeedProfile.scaledSettle(baseSeconds: learned, profile: activeSpeedProfile)
+            try? await Task.sleep(for: .seconds(scaled))
+            guard s.rcrRunning else { return }
+            let humanPause = SitePacingStore.shared.humanPauseSeconds(for: domain)
+            try? await Task.sleep(for: .seconds(humanPause))
             guard s.rcrRunning else { return }
         }
         if dualQuadActive {
@@ -1482,6 +1695,8 @@ final class QuadController {
         lane: Int
     ) async {
         guard dualQuadActive, s.rcrRunning else { return }
+        await waitIfPausedOrFrozen(s)
+        guard dualQuadActive, s.rcrRunning else { return }
 
         if TempDisabledStore.shared.isDisabled(credentialID: credential.id) {
             finishDualSide(session: s, lane: lane, status: .tempDisabled)
@@ -1534,6 +1749,7 @@ final class QuadController {
 
         s.rcrPasswords = filtered
         s.rcrPasswordIndex = 0
+        s.rcrPasswordsCredentialID = credential.id
         s.rcrTargetURL = targetURL
         s.rcrCurrentDomain = targetDomain
 
@@ -1571,6 +1787,8 @@ final class QuadController {
     }
 
     private func attemptFillDual(session s: QuadSession, lane: Int) async {
+        guard dualQuadActive, s.rcrRunning else { return }
+        await waitIfPausedOrFrozen(s)
         guard dualQuadActive, s.rcrRunning, !s.rcrPasswords.isEmpty else { return }
         guard let credential = currentDualCredential(s) else {
             finishDualSide(session: s, lane: lane, status: .failed)
@@ -1613,13 +1831,16 @@ final class QuadController {
 
         let extraCount = max(0, UserDefaults.standard.integer(forKey: "rcrExtraSubmits"))
         let rawDelay = UserDefaults.standard.double(forKey: "rcrSubmitDelay")
-        let delay = rawDelay > 0 ? rawDelay : 1.5
+        let baseDelay = rawDelay > 0 ? rawDelay : 1.5
+        let delay = max(0.2, baseDelay * activeSpeedProfile.submitGapMultiplier)
         if extraCount > 0 {
             // Self-driving loop — watchdog must not fire during it; it
             // re-arms when the loop hands back to the observer.
             cancelRCRWatchdog(for: s)
             s.rcrExtraSubmitsInFlight = true
             for _ in 0..<extraCount {
+                await waitIfPausedOrFrozen(s)
+                guard s.rcrRunning, dualQuadActive else { s.rcrExtraSubmitsInFlight = false; return }
                 try? await Task.sleep(for: .seconds(delay))
                 guard s.rcrRunning, dualQuadActive else { s.rcrExtraSubmitsInFlight = false; return }
                 _ = try? await s.webView?.evaluateJavaScript(submitScript)
@@ -1718,6 +1939,10 @@ final class QuadController {
     ) async {
         guard dualQuadActive, s.rcrRunning else { return }
         guard let credential = currentDualCredential(s), credential.id == credentialID else { return }
+        // Speed-scaled grace before judging so the page settles into its
+        // final state — slower profiles judge later, never sooner.
+        try? await Task.sleep(for: activeSpeedProfile.judgeGrace)
+        guard dualQuadActive, s.rcrRunning else { return }
         let image = await WebViewSnapshotter.capture(s.webView)
         let filename = image.flatMap { ScreenshotStorage.save($0) }
         let domain = s.rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain

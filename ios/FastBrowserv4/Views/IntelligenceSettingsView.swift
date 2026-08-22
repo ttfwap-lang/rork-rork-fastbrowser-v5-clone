@@ -12,6 +12,7 @@ struct IntelligenceSettingsView: View {
     @State private var parked = ParkedSessionStore.shared
     @State private var isAddingProvider: Bool = false
     @State private var routeTick: Int = 0
+    @State private var showAdvancedKeys: Bool = false
     @AppStorage("aiHealerEnabled") private var healerEnabled: Bool = true
     @AppStorage("aiSuccessDetectionMode") private var detectionModeRaw: String = SuccessJudgeEngine.DetectionMode.localAndAI.rawValue
     @AppStorage("aiVisionConsentGranted") private var visionConsent: Bool = false
@@ -20,6 +21,13 @@ struct IntelligenceSettingsView: View {
     var body: some View {
         Form {
             Section {
+                brainRow(
+                    icon: "cloud.fill",
+                    tint: .cyan,
+                    title: "Rork AI Cloud",
+                    note: center.rorkCloudNote,
+                    isReady: center.rorkCloudAvailable
+                )
                 brainRow(
                     icon: "iphone",
                     tint: .cyan,
@@ -34,19 +42,10 @@ struct IntelligenceSettingsView: View {
                     note: center.appleCloudNote,
                     isReady: center.appleCloudAvailable
                 )
-                brainRow(
-                    icon: "key.fill",
-                    tint: .orange,
-                    title: "Your API keys",
-                    note: center.hasUsableKeys
-                        ? "\(center.providers.filter { $0.keyCount > 0 }.count) provider(s) configured"
-                        : "No keys yet — add a provider below",
-                    isReady: center.hasUsableKeys
-                )
             } header: {
                 Text("Brains")
             } footer: {
-                Text("Jobs try your chosen brain first and fall over automatically if it's unavailable. Passwords and field contents are never sent to any AI — only page structure and visible text.")
+                Text("Jobs use Rork AI Cloud first (built in — no setup), then Apple's on-device model when offline. Apple Private Cloud needs iOS 27 and Apple's signing entitlement — it is not available on this build. Passwords and field contents are never sent to any AI — only page structure and visible text.")
             }
 
             Section {
@@ -75,52 +74,65 @@ struct IntelligenceSettingsView: View {
             } header: {
                 Text("Routing")
             } footer: {
-                Text("Quick checks stay on-device by default; fill repair uses the strongest brain you allow. Choose \"On-device\" everywhere for fully local-only AI.")
+                Text("Every job defaults to Rork AI Cloud and falls over automatically. Choose \"On-device\" everywhere for fully local-only AI.")
             }
 
             Section {
-                if providers.isEmpty {
-                    Text("No providers yet")
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(providers) { provider in
-                    NavigationLink {
-                        EditAIProviderView(config: provider)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 8) {
-                                Text(provider.displayName)
-                                    .font(.body.weight(.semibold))
-                                if !provider.isEnabled {
-                                    Text("OFF")
-                                        .font(.caption2.weight(.heavy))
-                                        .foregroundStyle(.orange)
+                DisclosureGroup(isExpanded: $showAdvancedKeys) {
+                    brainRow(
+                        icon: "key.fill",
+                        tint: .orange,
+                        title: "Your API keys",
+                        note: center.hasUsableKeys
+                            ? "\(center.providers.filter { $0.keyCount > 0 }.count) provider(s) configured"
+                            : "No keys yet — add a provider below",
+                        isReady: center.hasUsableKeys
+                    )
+                    if providers.isEmpty {
+                        Text("No providers yet")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(providers) { provider in
+                        NavigationLink {
+                            EditAIProviderView(config: provider)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 8) {
+                                    Text(provider.displayName)
+                                        .font(.body.weight(.semibold))
+                                    if !provider.isEnabled {
+                                        Text("OFF")
+                                            .font(.caption2.weight(.heavy))
+                                            .foregroundStyle(.orange)
+                                    }
+                                    if provider.lastTestOK {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.green)
+                                            .font(.caption)
+                                    }
                                 }
-                                if provider.lastTestOK {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(.green)
-                                        .font(.caption)
-                                }
+                                Text("\(provider.modelName) · \(provider.keyCount) key\(provider.keyCount == 1 ? "" : "s")")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
-                            Text("\(provider.modelName) · \(provider.keyCount) key\(provider.keyCount == 1 ? "" : "s")")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
                         }
                     }
-                }
-                .onDelete(perform: deleteProviders)
-                .onMove(perform: moveProviders)
+                    .onDelete(perform: deleteProviders)
+                    .onMove(perform: moveProviders)
 
-                Button {
-                    isAddingProvider = true
+                    Button {
+                        isAddingProvider = true
+                    } label: {
+                        Label("Add Provider…", systemImage: "plus.circle.fill")
+                            .foregroundStyle(.cyan)
+                    }
                 } label: {
-                    Label("Add Provider…", systemImage: "plus.circle.fill")
-                        .foregroundStyle(.cyan)
+                    Label("Advanced — your own API keys", systemImage: "key.fill")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.primary)
                 }
-            } header: {
-                Text("API Providers")
             } footer: {
-                Text("OpenAI-compatible endpoints. Providers are tried in the order shown; keys inside a provider rotate automatically when one is rate-limited.")
+                Text("Bring your own OpenAI-compatible provider if you prefer it over the built-in cloud. Providers are tried in the order shown; keys inside a provider rotate automatically when one is rate-limited.")
             }
 
             Section {
@@ -195,11 +207,10 @@ struct IntelligenceSettingsView: View {
     }
 
     private var visionConsentFooter: String {
-        let provider = center.providers.first(where: { $0.keyCount > 0 })?.displayName ?? "your API provider"
         if visionConsent {
-            return "On unclear pages only, a screenshot of the page (never passwords) may be sent to \(provider) for a picture-based judgement."
+            return "On unclear pages only, a screenshot of the page (never passwords) may be sent to the AI brain for a picture-based judgement."
         }
-        return "Turn this on to let \(provider) see a screenshot of an unclear page. Passwords are never included. Off by default."
+        return "Turn this on to let the AI brain see a screenshot of an unclear page. Passwords are never included. Off by default."
     }
 
     private func brainRow(icon: String, tint: Color, title: String, note: String, isReady: Bool) -> some View {

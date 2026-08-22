@@ -21,6 +21,12 @@ enum PageSettleService {
     static let normalCookieGraceMs: Int = 1_500
     static let normalCookieTimeoutMs: Int = 10_000
 
+    /// Shared per-attempt observation watchdog for both single-window and
+    /// multi-window RCR — one definition so the two can never drift.
+    /// `SpeedProfile.effectiveWatchdog` stretches it for slow profiles and
+    /// never lets fast profiles shrink it.
+    static let attemptWatchdog: Duration = .seconds(12)
+
     /// Parses `detectLoginFormScript()` output. Pure so tests can cover it.
     nonisolated static func parseHasLoginForm(_ raw: Any?) -> Bool {
         guard let json = raw as? String,
@@ -41,12 +47,5 @@ enum PageSettleService {
             if parseHasLoginForm(raw) { return }
             try? await Task.sleep(for: loginFormPollInterval)
         }
-    }
-}
-
-private extension Duration {
-    var seconds: TimeInterval {
-        let c = components
-        return TimeInterval(c.seconds) + TimeInterval(c.attoseconds) / 1_000_000_000_000_000_000
     }
 }

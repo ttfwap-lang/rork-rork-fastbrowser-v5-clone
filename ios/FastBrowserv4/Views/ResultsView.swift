@@ -240,6 +240,13 @@ private struct ResultRow: View {
                 } else if let cat = record.ocrCategory, cat != "Unknown" {
                     OcrBadge(category: cat)
                 }
+                if record.status == .skipped, let reason = record.judgeReason, !reason.isEmpty {
+                    Text(reason)
+                        .font(.system(size: 8))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                }
             }
         }
         .padding(.vertical, 4)

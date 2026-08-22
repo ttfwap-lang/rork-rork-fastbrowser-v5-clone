@@ -11,6 +11,10 @@ nonisolated enum IntelligenceError: Error, Sendable {
     case noKeysConfigured
     case malformedReply
     case allBrainsFailed
+    /// A single brain attempt exceeded its time budget (stall guard).
+    case timedOut
+    /// The whole ask exceeded its total budget across all brain attempts.
+    case totalTimedOut
 }
 
 /// Central router for every AI decision in the app. Picks the right "brain"
@@ -29,6 +33,7 @@ final class IntelligenceCenter {
 
     /// Which brain serves a job.
     nonisolated enum AIBrain: String, CaseIterable, Identifiable, Sendable {
+        case rorkCloud
         case onDevice
         case appleCloud
         case byokKey
@@ -37,6 +42,7 @@ final class IntelligenceCenter {
 
         var label: String {
             switch self {
+            case .rorkCloud: return "Rork Cloud"
             case .onDevice: return "On-device"
             case .appleCloud: return "Apple Cloud"
             case .byokKey: return "Your API keys"
@@ -66,10 +72,13 @@ final class IntelligenceCenter {
         var settingsKey: String { "aiRoute.\(rawValue)" }
 
         var `default`: AIBrain {
+            // Rork AI Cloud is the out-of-the-box default for every job —
+            // no setup, no keys. On-device Apple Intelligence is the
+            // offline fallback; BYOK remains available under Advanced.
             switch self {
-            case .quick: return .onDevice
-            case .verdict: return .onDevice
-            case .heal: return .appleCloud
+            case .quick: return .rorkCloud
+            case .verdict: return .rorkCloud
+            case .heal: return .rorkCloud
             }
         }
     }
@@ -89,6 +98,8 @@ final class IntelligenceCenter {
     private(set) var onDeviceNote: String = "Checking…"
     private(set) var appleCloudAvailable: Bool = false
     private(set) var appleCloudNote: String = "Checking…"
+    private(set) var rorkCloudAvailable: Bool = false
+    private(set) var rorkCloudNote: String = "Checking…"
 
     /// Active BYOK providers (enabled only), sorted by sortOrder.
     private(set) var providers: [AIProviderConfig] = []
@@ -121,8 +132,12 @@ final class IntelligenceCenter {
         providers.contains { $0.keyCount > 0 }
     }
 
-    /// Re-polls Apple model availability (on-device + Private Cloud Compute).
-    /// Cheap; call on settings open and app foreground.
+    /// The Rork Cloud model every job uses by default.
+    nonisolated static let rorkCloudModel = "google/gemini-2.5-flash"
+
+    /// Re-polls Apple model availability (on-device + Private Cloud Compute)
+    /// and the Rork Cloud wiring. Cheap; call on settings open and app
+    /// foreground.
     func refreshAvailability() {
         let onDevice = SystemLanguageModel.default
         switch onDevice.availability {
@@ -133,6 +148,16 @@ final class IntelligenceCenter {
             onDeviceAvailable = false
             onDeviceNote = Self.reasonText(reason)
         }
+
+        // Rork AI Cloud is available when the build injected the toolkit
+        // endpoint and its delegated secret. The values are empty in source
+        // and filled in by the build pipeline.
+        let toolkitBase = Config.EXPO_PUBLIC_TOOLKIT_URL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let toolkitSecret = Config.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY.trimmingCharacters(in: .whitespacesAndNewlines)
+        rorkCloudAvailable = !toolkitBase.isEmpty && !toolkitSecret.isEmpty
+        rorkCloudNote = rorkCloudAvailable
+            ? "Ready — built-in, no setup"
+            : "Unavailable on this build"
 
         // Private Cloud Compute is real on iOS 27. It needs Apple
         // Intelligence (same device/region prerequisite as the on-device
@@ -150,11 +175,11 @@ final class IntelligenceCenter {
                 : "Needs Apple Intelligence turned on"
             #else
             appleCloudAvailable = false
-            appleCloudNote = "Activates on an iOS 27 build"
+            appleCloudNote = "Not available — requires iOS 27"
             #endif
         } else {
             appleCloudAvailable = false
-            appleCloudNote = "Requires iOS 27"
+            appleCloudNote = "Not available — requires iOS 27"
         }
     }
 
@@ -177,19 +202,22 @@ final class IntelligenceCenter {
     }
 
     /// Preferred brain first, then the remaining brains in a canonical
-    /// privacy-first order, filtered to those that can actually serve today.
+    /// privacy-first order (Rork Cloud → on-device → Apple Cloud → BYOK),
+    /// filtered to those that can actually serve today.
     nonisolated static func attemptOrder(
         preferred: AIBrain,
+        rorkOK: Bool,
         onDeviceOK: Bool,
         cloudOK: Bool,
         keysOK: Bool
     ) -> [AIBrain] {
         var order: [AIBrain] = [preferred]
-        for brain in [AIBrain.onDevice, .appleCloud, .byokKey] where !order.contains(brain) {
+        for brain in [AIBrain.rorkCloud, .onDevice, .appleCloud, .byokKey] where !order.contains(brain) {
             order.append(brain)
         }
         return order.filter { brain in
             switch brain {
+            case .rorkCloud: return rorkOK
             case .onDevice: return onDeviceOK
             case .appleCloud: return cloudOK
             case .byokKey: return keysOK
@@ -210,10 +238,35 @@ final class IntelligenceCenter {
     /// never be in the image or the prompt. Apple brains use native picture
     /// input on an iOS 27 SDK build and fall back to the text prompt (which
     /// already includes OCR) on the current toolchain.
+    ///
+    /// Stall guards: each brain attempt gets its own time budget and the
+    /// whole ask a total budget, so a wedged provider can never freeze a
+    /// run — it times out, fails over to the next brain, and finally
+    /// surfaces `totalTimedOut` so callers fall back to local judgement.
     func ask(job: AIJob, system: String, user: String, imageJPEG: Data?) async throws -> AIAnswer {
+        do {
+            return try await withTimeout(Self.totalAskBudget) {
+                try await self.askWithinBudget(job: job, system: system, user: user, imageJPEG: imageJPEG)
+            }
+        } catch IntelligenceError.timedOut {
+            throw IntelligenceError.totalTimedOut
+        }
+    }
+
+    /// Per-attempt and per-brain time budgets for the stall guards.
+    nonisolated static let brainAttemptBudget: Duration = .seconds(15)
+    nonisolated static let totalAskBudget: Duration = .seconds(30)
+
+    private func askWithinBudget(
+        job: AIJob,
+        system: String,
+        user: String,
+        imageJPEG: Data?
+    ) async throws -> AIAnswer {
         refreshProviders()
         let order = Self.attemptOrder(
             preferred: preferredBrain(for: job),
+            rorkOK: rorkCloudAvailable,
             onDeviceOK: onDeviceAvailable,
             cloudOK: appleCloudAvailable,
             keysOK: hasUsableKeys
@@ -221,17 +274,30 @@ final class IntelligenceCenter {
         var lastError: Error = IntelligenceError.allBrainsFailed
         for brain in order {
             do {
+                let text: String
+                let detail: String
                 switch brain {
+                case .rorkCloud:
+                    (text, detail) = try await withTimeout(Self.brainAttemptBudget) {
+                        let answer = try await self.askRorkCloud(system: system, user: user, imageJPEG: imageJPEG)
+                        return (answer, "Rork Cloud")
+                    }
                 case .onDevice:
-                    let text = try await askApple(cloud: false, system: system, user: user, imageJPEG: imageJPEG)
-                    return AIAnswer(text: text, brain: brain, brainDetail: "On-device")
+                    (text, detail) = try await withTimeout(Self.brainAttemptBudget) {
+                        let answer = try await self.askApple(cloud: false, system: system, user: user, imageJPEG: imageJPEG)
+                        return (answer, "On-device")
+                    }
                 case .appleCloud:
-                    let text = try await askApple(cloud: true, system: system, user: user, imageJPEG: imageJPEG)
-                    return AIAnswer(text: text, brain: brain, brainDetail: "Apple Cloud")
+                    (text, detail) = try await withTimeout(Self.brainAttemptBudget) {
+                        let answer = try await self.askApple(cloud: true, system: system, user: user, imageJPEG: imageJPEG)
+                        return (answer, "Apple Cloud")
+                    }
                 case .byokKey:
-                    let (text, detail) = try await askBYOK(system: system, user: user, imageJPEG: imageJPEG)
-                    return AIAnswer(text: text, brain: brain, brainDetail: detail)
+                    (text, detail) = try await withTimeout(Self.brainAttemptBudget) {
+                        try await self.askBYOK(system: system, user: user, imageJPEG: imageJPEG)
+                    }
                 }
+                return AIAnswer(text: text, brain: brain, brainDetail: detail)
             } catch {
                 Self.logger.log("Brain \(brain.rawValue, privacy: .public) failed for job \(job.rawValue, privacy: .public): \(String(describing: error), privacy: .public)")
                 lastError = error
@@ -241,33 +307,83 @@ final class IntelligenceCenter {
         throw lastError
     }
 
+    /// Races `operation` against `budget`; the budget expiring wins with
+    /// `IntelligenceError.timedOut` and cancels the losing operation.
+    private func withTimeout<T: Sendable>(
+        _ budget: Duration,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(for: budget)
+                throw IntelligenceError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw IntelligenceError.timedOut
+            }
+            return result
+        }
+    }
+
+    // MARK: - Rork AI Cloud brain
+
+    /// The app's built-in brain: Gemini 2.5 Flash through the Rork toolkit
+    /// proxy (OpenAI-compatible chat endpoint). Uses the build-injected
+    /// endpoint + delegated secret; costs ride the project's cloud credits.
+    private func askRorkCloud(system: String, user: String, imageJPEG: Data?) async throws -> String {
+        let base = Config.EXPO_PUBLIC_TOOLKIT_URL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secret = Config.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty, !secret.isEmpty else {
+            throw IntelligenceError.brainUnavailable
+        }
+        return try await client.chat(
+            system: system,
+            user: user,
+            imageJPEG: imageJPEG,
+            endpoint: .init(
+                baseURL: base + "/v2/vercel/v1",
+                apiKey: secret,
+                model: Self.rorkCloudModel
+            )
+        )
+    }
+
     /// Asks for a JSON reply and decodes it. On a malformed reply, retries
     /// once with a sharper instruction before failing over.
-    func askJSON<T: Decodable>(job: AIJob, system: String, user: String, as type: T.Type) async throws -> (T, AIAnswer) {
+    func askJSON<T: Decodable & Sendable>(job: AIJob, system: String, user: String, as type: T.Type) async throws -> (T, AIAnswer) {
         try await askJSON(job: job, system: system, user: user, imageJPEG: nil, as: type)
     }
 
-    func askJSON<T: Decodable>(
+    /// Total budget for a JSON ask including its one retry — keeps the
+    /// judge/heal stall guard tight even when a malformed reply forces the
+    /// sharper retry prompt.
+    nonisolated static let jsonAskBudget: Duration = .seconds(45)
+
+    func askJSON<T: Decodable & Sendable>(
         job: AIJob,
         system: String,
         user: String,
         imageJPEG: Data?,
         as type: T.Type
     ) async throws -> (T, AIAnswer) {
-        var answer = try await ask(job: job, system: system + Self.jsonContract, user: user, imageJPEG: imageJPEG)
-        if let value = Self.decodeJSON(T.self, from: answer.text) {
+        try await withTimeout(Self.jsonAskBudget) {
+            var answer = try await self.ask(job: job, system: system + Self.jsonContract, user: user, imageJPEG: imageJPEG)
+            if let value = Self.decodeJSON(T.self, from: answer.text) {
+                return (value, answer)
+            }
+            answer = try await self.ask(
+                job: job,
+                system: system + Self.jsonContract + "\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
+                user: user,
+                imageJPEG: imageJPEG
+            )
+            guard let value = Self.decodeJSON(T.self, from: answer.text) else {
+                throw IntelligenceError.malformedReply
+            }
             return (value, answer)
         }
-        answer = try await ask(
-            job: job,
-            system: system + Self.jsonContract + "\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
-            user: user,
-            imageJPEG: imageJPEG
-        )
-        guard let value = Self.decodeJSON(T.self, from: answer.text) else {
-            throw IntelligenceError.malformedReply
-        }
-        return (value, answer)
     }
 
     private static let jsonContract = """

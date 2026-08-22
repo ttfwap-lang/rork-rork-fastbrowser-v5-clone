@@ -21,7 +21,7 @@ struct LockScreenView: View {
                 .symbolEffect(.bounce, value: pulseCount)
 
             VStack(spacing: 8) {
-                Text("Fast Fill Browser")
+                Text("Fast 6 Browser")
                     .font(.title.bold())
 
                 Text("Unlock to access your credentials")

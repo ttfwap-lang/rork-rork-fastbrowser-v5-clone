@@ -75,7 +75,7 @@ struct SpeedDialHomeView: View {
                 ))
                 .shadow(color: .cyan.opacity(0.4), radius: 12, y: 4)
 
-            Text("Fast Fill")
+            Text("Fast 6")
                 .font(.system(.largeTitle, design: .rounded).weight(.heavy))
 
             Text("Tap a shortcut to get started")

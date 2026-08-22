@@ -45,7 +45,7 @@ struct AppSettingsView: View {
             } header: {
                 Text("AI Copilot")
             } footer: {
-                Text("Choose which AI repairs stuck logins and judges success — Apple's on-device model, Apple's private cloud, or your own API keys. Passwords are never shared with any AI.")
+                Text("Fast 6 uses the built-in Rork AI Cloud by default, with Apple's on-device model as the offline fallback. Your own keys stay available under Advanced. Passwords are never shared with any AI.")
             }
 
             Section {
@@ -151,7 +151,7 @@ struct AppSettingsView: View {
                             endPoint: .bottomTrailing
                         ))
                     VStack(alignment: .leading) {
-                        Text("Fast Fill Browser")
+                        Text("Fast 6 Browser")
                             .font(.headline)
                         Text("The smartest, most forgiving login browser")
                             .font(.caption)

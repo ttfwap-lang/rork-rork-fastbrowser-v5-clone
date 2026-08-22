@@ -30,7 +30,7 @@ class BiometricService {
         do {
             let success = try await context.evaluatePolicy(
                 .deviceOwnerAuthentication,
-                localizedReason: "Unlock Fast Fill Browser to access your credentials"
+                localizedReason: "Unlock Fast 6 Browser to access your credentials"
             )
             isUnlocked = success
             return success

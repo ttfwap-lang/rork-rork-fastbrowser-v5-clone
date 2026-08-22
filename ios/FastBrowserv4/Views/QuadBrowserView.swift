@@ -281,7 +281,7 @@ struct QuadBrowserView: View {
                     HStack {
                         HStack(spacing: 6) {
                             Circle()
-                                .fill(statusColor(session.rcrStatus))
+                                .fill(RunStatusStyle.color(for: session.rcrStatus.styleKey))
                                 .frame(width: 6, height: 6)
                             Text(session.id)
                                 .font(.system(size: 10, weight: .heavy, design: .rounded))
@@ -342,20 +342,14 @@ struct QuadBrowserView: View {
             .onTapGesture {
                 controller.focusedIndex = session.index
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "Window \(session.id)\(session.isDisabled ? ", unused" : "")"
+            )
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction {
+                controller.focusedIndex = session.index
+            }
         )
-    }
-
-    private func statusColor(_ s: QuadSession.Status) -> Color {
-        switch s {
-        case .idle: return .secondary
-        case .navigating: return .blue
-        case .filling: return .cyan
-        case .submitting: return .indigo
-        case .waiting: return .yellow
-        case .burning: return .orange
-        case .success: return .green
-        case .finished: return .mint
-        case .pairWait: return .teal
-        }
     }
 }

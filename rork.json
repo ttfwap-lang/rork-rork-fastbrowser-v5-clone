@@ -2,11 +2,11 @@
   "$schema": "https://rork.com/schema/rork.json",
   "apps": [
     {
-      "name": "Fast Fill Browser 0.2",
+      "name": "Fast 6 Browser",
       "path": "ios",
       "framework": "swift",
       "settings": {
-        "displayName": "Fast Browserv4"
+        "displayName": "Fast 6 Browser"
       }
     }
   ]

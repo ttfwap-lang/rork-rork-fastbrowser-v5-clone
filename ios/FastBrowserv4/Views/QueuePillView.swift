@@ -2,6 +2,8 @@ import SwiftUI
 
 /// Translucent pill that shows the current RCR target plus the next 8
 /// credentials in the queue, with a collapsible completed list underneath.
+/// Also hosts the run cockpit: live speed dial, pause/resume, skip, retry,
+/// and (in grid mode) a per-window freeze control.
 struct QueuePillView: View {
     let title: String
     let titleColor: Color
@@ -16,13 +18,25 @@ struct QueuePillView: View {
     /// Optional "View Results" action shown when the run is finished.
     let onViewResults: (() -> Void)?
 
+    // MARK: - Run cockpit (all optional with sensible defaults)
+
+    var speedProfile: SpeedProfile = .normal
+    var onSpeedChange: (SpeedProfile) -> Void = { _ in }
+    var isPaused: Bool = false
+    var onTogglePause: () -> Void = {}
+    var onSkip: () -> Void = {}
+    var onRetry: () -> Void = {}
+    /// Non-nil in grid mode — shows the per-window freeze control.
+    var isFrozen: Bool = false
+    var onToggleFreeze: (() -> Void)? = nil
+
     @State private var showAll: Bool = false
     @State private var showCompleted: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
-
+            cockpitRow
             if let current = upcoming.first {
                 currentRow(current)
             }
@@ -58,6 +72,7 @@ struct QueuePillView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(showCompleted ? "Hide completed" : "Show completed")
 
                 if showCompleted {
                     VStack(spacing: 4) {
@@ -122,6 +137,106 @@ struct QueuePillView: View {
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
         }
+    }
+
+    // MARK: - Cockpit
+
+    /// Live speed dial + pause/skip/retry/freeze controls, all in the same
+    /// glass/cyan/monospaced visual family as the rest of the pill.
+    private var cockpitRow: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 3) {
+                ForEach(SpeedProfile.allCases) { profile in
+                    Button {
+                        onSpeedChange(profile)
+                    } label: {
+                        Image(systemName: profile.systemImage)
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(speedProfile == profile ? AnyShapeStyle(Color.cyan) : AnyShapeStyle(.secondary))
+                            .frame(width: 30, height: 26)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(speedProfile == profile ? Color.cyan.opacity(0.2) : Color.clear)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .stroke(speedProfile == profile ? Color.cyan.opacity(0.45) : Color.clear, lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Speed \(profile.label)")
+                    .accessibilityAddTraits(speedProfile == profile ? [.isSelected] : [])
+                }
+            }
+            .padding(2)
+            .background(
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(Color.primary.opacity(0.05))
+            )
+
+            Spacer(minLength: 0)
+
+            cockpitButton(
+                icon: isPaused ? "play.fill" : "pause.fill",
+                label: isPaused ? "Resume" : "Pause",
+                tint: isPaused ? RunStatusStyle.amber : Color.secondary,
+                active: isPaused,
+                action: onTogglePause
+            )
+            cockpitButton(
+                icon: "forward.end.fill",
+                label: "Skip",
+                tint: .orange,
+                active: false,
+                action: onSkip
+            )
+            cockpitButton(
+                icon: "arrow.counterclockwise",
+                label: "Retry",
+                tint: .cyan,
+                active: false,
+                action: onRetry
+            )
+            if let onToggleFreeze {
+                cockpitButton(
+                    icon: isFrozen ? "play.slash.fill" : "snowflake",
+                    label: isFrozen ? "Thaw" : "Freeze",
+                    tint: .indigo,
+                    active: isFrozen,
+                    action: onToggleFreeze
+                )
+            }
+        }
+    }
+
+    private func cockpitButton(
+        icon: String,
+        label: String,
+        tint: Color,
+        active: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: icon)
+                    .font(.system(size: 9, weight: .bold))
+                Text(label)
+                    .font(.system(size: 9, weight: .heavy))
+                    .kerning(0.2)
+            }
+            .foregroundStyle(active ? AnyShapeStyle(tint) : AnyShapeStyle(.secondary))
+            .padding(.horizontal, 7)
+            .frame(height: 28)
+            .background(
+                Capsule()
+                    .fill(active ? tint.opacity(0.2) : Color.primary.opacity(0.05))
+                    .overlay(
+                        Capsule().stroke(active ? tint.opacity(0.5) : Color.clear, lineWidth: 1)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
     }
 
     private func currentRow(_ item: RCRQueueItem) -> some View {

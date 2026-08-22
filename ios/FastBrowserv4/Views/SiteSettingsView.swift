@@ -15,6 +15,8 @@ struct SiteSettingsView: View {
     @State private var retryCount: Int = 1
     @State private var retryDelay: Double = 1.0
     @State private var isDetectResponse: Bool = false
+    @State private var learnedSettleSeconds: Double = SitePacingStore.defaultSettleSeconds
+    @State private var hasLearnedSettle: Bool = false
 
     var body: some View {
         Form {
@@ -79,6 +81,22 @@ struct SiteSettingsView: View {
             } footer: {
                 Text("After each auto-submit, watches the page briefly and shows a toast: succeeded, failed, blocked, or no response. Informational only — never changes RCR behavior.")
             }
+
+            Section {
+                LabeledContent(
+                    "Learned page-settle time",
+                    value: String(format: "%.1fs", learnedSettleSeconds)
+                )
+                Button("Reset learned pacing", role: .destructive) {
+                    SitePacingStore.shared.reset(domain: domain)
+                    refreshPacing()
+                }
+                .disabled(!hasLearnedSettle)
+            } header: {
+                Text("Smart Pacing")
+            } footer: {
+                Text("Fast 6 learns how long this site really needs after a page loads (consent banners included) and pauses that long before filling. Learning is always kept between 0.6s and 12s.")
+            }
         }
         .navigationTitle("Site Settings")
         .navigationBarTitleDisplayMode(.inline)
@@ -111,6 +129,12 @@ struct SiteSettingsView: View {
         isDetectResponse = UserDefaults.standard.bool(
             forKey: BrowserViewModel.detectResponseKey(for: domain)
         )
+        refreshPacing()
+    }
+
+    private func refreshPacing() {
+        hasLearnedSettle = SitePacingStore.shared.hasLearned(for: domain)
+        learnedSettleSeconds = SitePacingStore.shared.settleSeconds(for: domain)
     }
 
     private func save() {

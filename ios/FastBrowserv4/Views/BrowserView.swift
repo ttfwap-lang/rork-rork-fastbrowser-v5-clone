@@ -344,17 +344,17 @@ struct BrowserView: View {
 
     private var bottomToolbar: some View {
         HStack(spacing: 0) {
-            toolbarButton(icon: "chevron.left", disabled: !canGoBack) {
+            toolbarButton(icon: "chevron.left", label: "Back", disabled: !canGoBack) {
                 viewModel.goBack()
             }
 
-            toolbarButton(icon: "chevron.right", disabled: !canGoForward) {
+            toolbarButton(icon: "chevron.right", label: "Forward", disabled: !canGoForward) {
                 viewModel.goForward()
             }
 
             rcrButton
 
-            toolbarButton(icon: "flame.fill", tint: .red) {
+            toolbarButton(icon: "flame.fill", label: "Burn session", tint: .red) {
                 viewModel.burnCurrentTab()
             }
 
@@ -529,9 +529,14 @@ struct BrowserView: View {
         QueuePillView(
             title: "RCR",
             titleColor: .cyan,
-            statusDotColor: statusColor(viewModel.rcrStatus),
-            statusLabel: statusLabel(viewModel.rcrStatus),
-            isWaitingPulse: viewModel.rcrStatus == .waiting || viewModel.rcrStatus == .filling,
+            statusDotColor: viewModel.isRCRPaused
+                ? RunStatusStyle.amber
+                : RunStatusStyle.color(for: viewModel.rcrStatus.styleKey),
+            statusLabel: viewModel.isRCRPaused
+                ? "paused"
+                : RunStatusStyle.label(for: viewModel.rcrStatus.styleKey),
+            isWaitingPulse: !viewModel.isRCRPaused
+                && (viewModel.rcrStatus == .waiting || viewModel.rcrStatus == .filling),
             total: viewModel.rcrTotal,
             completedCount: viewModel.rcrCompletedIDs.count,
             upcoming: viewModel.queueSnapshot(upcomingLimit: 8),
@@ -539,7 +544,13 @@ struct BrowserView: View {
             pulseTrigger: viewModel.rcrIndex,
             onViewResults: {
                 viewModel.presentedSheet = .results
-            }
+            },
+            speedProfile: viewModel.runSpeedProfile,
+            onSpeedChange: { viewModel.setRunSpeedProfile($0) },
+            isPaused: viewModel.isRCRPaused,
+            onTogglePause: { viewModel.toggleRCRPause() },
+            onSkip: { viewModel.skipCurrentCredential() },
+            onRetry: { viewModel.retryCurrentPassword() }
         )
     }
 
@@ -574,8 +585,8 @@ struct BrowserView: View {
                 label: "Pair \(lane + 1)",
                 doneCount: done,
                 currentUsername: sessionA.rcrCurrentUsername,
-                statusColorA: quadStatusColor(sessionA.rcrStatus),
-                statusColorB: quadStatusColor(sessionB.rcrStatus)
+                statusColorA: RunStatusStyle.color(for: sessionA.rcrStatus.styleKey),
+                statusColorB: RunStatusStyle.color(for: sessionB.rcrStatus.styleKey)
             )
         }
     }
@@ -602,7 +613,16 @@ struct BrowserView: View {
                 overallTotal: quadOverallStats.total,
                 overallSuccess: quadOverallStats.success,
                 anyRunning: viewModel.quadController.anyRCRRunning,
-                lanes: quadLaneSummaries
+                lanes: quadLaneSummaries,
+                isPausedAll: viewModel.quadController.isQuadRCRPaused,
+                onTogglePauseAll: { viewModel.quadController.toggleQuadRCRPause() },
+                freezeItems: viewModel.quadController.enabledSessions.map {
+                    QuadSummaryBarView.FreezeItem(id: $0.id, isFrozen: $0.isRCRFrozen)
+                },
+                onToggleFreeze: { id in
+                    guard let session = viewModel.quadController.sessions.first(where: { $0.id == id }) else { return }
+                    viewModel.quadController.toggleSessionFrozen(session)
+                }
             )
             .onTapGesture {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
@@ -655,9 +675,19 @@ struct BrowserView: View {
                     QueuePillView(
                         title: viewModel.isDualQuadMode ? "\(session.id) · \(session.targetSiteIndex == 0 ? "A" : "B")" : session.id,
                         titleColor: .cyan,
-                        statusDotColor: quadStatusColor(session.rcrStatus),
-                        statusLabel: quadStatusLabel(session.rcrStatus),
-                        isWaitingPulse: session.rcrStatus == .waiting || session.rcrStatus == .filling,
+                        statusDotColor: session.isRCRFrozen
+                            ? RunStatusStyle.color(for: "frozen")
+                            : (viewModel.quadController.isQuadRCRPaused
+                                ? RunStatusStyle.amber
+                                : RunStatusStyle.color(for: session.rcrStatus.styleKey)),
+                        statusLabel: session.isRCRFrozen
+                            ? "frozen"
+                            : (viewModel.quadController.isQuadRCRPaused
+                                ? "paused"
+                                : RunStatusStyle.label(for: session.rcrStatus.styleKey)),
+                        isWaitingPulse: !session.isRCRFrozen
+                            && !viewModel.quadController.isQuadRCRPaused
+                            && (session.rcrStatus == .waiting || session.rcrStatus == .filling),
                         total: session.rcrTotal,
                         completedCount: session.rcrCompletedIDs.count,
                         upcoming: viewModel.quadController.queueSnapshot(for: session, upcomingLimit: 4),
@@ -665,7 +695,15 @@ struct BrowserView: View {
                         pulseTrigger: session.rcrIndex,
                         onViewResults: {
                             viewModel.presentedSheet = .results
-                        }
+                        },
+                        speedProfile: viewModel.runSpeedProfile,
+                        onSpeedChange: { viewModel.setRunSpeedProfile($0) },
+                        isPaused: viewModel.quadController.isQuadRCRPaused,
+                        onTogglePause: { viewModel.quadController.toggleQuadRCRPause() },
+                        onSkip: { viewModel.quadController.skipCurrentForSession(session) },
+                        onRetry: { viewModel.quadController.retryCurrentForSession(session) },
+                        isFrozen: session.isRCRFrozen,
+                        onToggleFreeze: { viewModel.quadController.toggleSessionFrozen(session) }
                     )
                 }
             }
@@ -723,60 +761,6 @@ struct BrowserView: View {
         }
     }
 
-    // MARK: - Status helpers
-
-    private func statusColor(_ s: BrowserViewModel.RCRStatus) -> Color {
-        switch s {
-        case .idle: return .secondary
-        case .navigating: return .blue
-        case .filling: return .cyan
-        case .submitting: return .indigo
-        case .waiting: return .yellow
-        case .burning: return .orange
-        case .success: return .green
-        }
-    }
-
-    private func statusLabel(_ s: BrowserViewModel.RCRStatus) -> String {
-        switch s {
-        case .idle: return "idle"
-        case .navigating: return "loading"
-        case .filling: return "filling"
-        case .submitting: return "submitting"
-        case .waiting: return "watching"
-        case .burning: return "burning"
-        case .success: return "success"
-        }
-    }
-
-    private func quadStatusColor(_ s: QuadSession.Status) -> Color {
-        switch s {
-        case .idle: return .secondary
-        case .navigating: return .blue
-        case .filling: return .cyan
-        case .submitting: return .indigo
-        case .waiting: return .yellow
-        case .burning: return .orange
-        case .success: return .green
-        case .finished: return .mint
-        case .pairWait: return .teal
-        }
-    }
-
-    private func quadStatusLabel(_ s: QuadSession.Status) -> String {
-        switch s {
-        case .idle: return "idle"
-        case .navigating: return "loading"
-        case .filling: return "filling"
-        case .submitting: return "submitting"
-        case .waiting: return "watching"
-        case .burning: return "burning"
-        case .success: return "success"
-        case .finished: return "done"
-        case .pairWait: return "linked"
-        }
-    }
-
     // MARK: - More menu
 
     private var moreMenu: some View {
@@ -831,6 +815,7 @@ struct BrowserView: View {
 
     private func toolbarButton(
         icon: String,
+        label: String,
         disabled: Bool = false,
         tint: Color? = nil,
         action: @escaping () -> Void
@@ -843,6 +828,7 @@ struct BrowserView: View {
                 .contentShape(Rectangle())
         }
         .disabled(disabled)
+        .accessibilityLabel(label)
         .frame(maxWidth: .infinity)
     }
 

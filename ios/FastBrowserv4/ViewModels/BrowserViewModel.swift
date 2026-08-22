@@ -72,6 +72,14 @@ class BrowserViewModel {
     var rcrQueueUsernames: [String] = []
     var rcrQueuePasswordCounts: [Int] = []
     var rcrCompletedIDs: Set<String> = []
+    /// Live run-speed profile for the cockpit dial. Persisted so the next
+    /// run starts with the same setting. Mid-run changes apply on the next
+    /// attempt step, never mid-submit.
+    var runSpeedProfile: SpeedProfile = SpeedProfile.saved
+    /// True while the run rests between attempts (never mid-fill). The
+    /// status dot glows amber while paused.
+    private(set) var isRCRPaused: Bool = false
+    private var rcrPauseContinuation: CheckedContinuation<Void, Never>?
     /// True when the user wants to re-try credentials that previously
     /// returned `failed` (non-success / non-disabled). Off by default —
     /// resume-safe runs skip every terminally-attempted password.
@@ -81,6 +89,21 @@ class BrowserViewModel {
     private var rcrQueueIDs: [String] = []
     private var rcrCurrentPasswords: [String] = []
     private var rcrPasswordIndex: Int = 0
+    /// Which credential the in-memory `rcrCurrentPasswords` list belongs
+    /// to. Guards against the cross-credential bug where a parked run
+    /// handed the next credential the previous one's password list.
+    private var rcrPasswordsCredentialID: String = ""
+    /// Bumped by skip/retry/stop so in-flight fill legs (extra-submit
+    /// loops) can detect they've been superseded and bail out instead of
+    /// racing the new attempt.
+    private var rcrAttemptGeneration: Int = 0
+
+    /// Pure cross-credential guard, shared with the grid runner: the
+    /// in-memory list belongs to `credentialID` only when the IDs match
+    /// and are non-empty.
+    nonisolated static func passwordListBelongs(to credentialID: String, listCredentialID: String) -> Bool {
+        !credentialID.isEmpty && credentialID == listCredentialID
+    }
     private var rcrAwaitingNavigation: Bool = false
     /// True while the success cascade is capturing / asking the AI so a
     /// second observer ping cannot double-advance the same attempt.
@@ -98,7 +121,9 @@ class BrowserViewModel {
     /// dead page, wedged web process). Without it the runner sits in
     /// "watching" forever with no recovery.
     private var rcrWatchdogTask: Task<Void, Never>?
-    private static let rcrWatchdogTimeout: Duration = .seconds(12)
+    /// Shared base timeout — defined once in PageSettleService so the two
+    /// runners can never drift apart.
+    private static let rcrWatchdogTimeout: Duration = PageSettleService.attemptWatchdog
 
     /// True while the user is editing the URL bar — suppresses programmatic
     /// overwrites from navigation events so the user's in-progress text is
@@ -1221,6 +1246,11 @@ class BrowserViewModel {
         rcrStartGeneration &+= 1
         cancelRCRWatchdog()
         rcrJudging = false
+        // A paused run being stopped must not leave the runner suspended
+        // forever on its continuation.
+        isRCRPaused = false
+        rcrPauseContinuation?.resume()
+        rcrPauseContinuation = nil
         isRCRRunning = false
         rcrStatus = .idle
         rcrAwaitingNavigation = false
@@ -1228,6 +1258,8 @@ class BrowserViewModel {
         rcrTargetURL = nil
         // Don't leave plaintext passwords sitting in memory after a stop.
         rcrCurrentPasswords = []
+        rcrPasswordsCredentialID = ""
+        rcrAttemptGeneration &+= 1
         activeTab?.webView?.evaluateJavaScript(
             JavaScriptInjectionService.rcrUninstallObserverScript(),
             completionHandler: nil
@@ -1255,6 +1287,7 @@ class BrowserViewModel {
 
     private func runCurrentCredential() async {
         guard isRCRRunning else { return }
+        await waitIfPaused()
         // Skip any credentials in temp-disabled cooldown OR ever perma-disabled.
         while rcrIndex < rcrQueueIDs.count {
             let id = rcrQueueIDs[rcrIndex]
@@ -1337,6 +1370,7 @@ class BrowserViewModel {
 
         rcrCurrentPasswords = filtered
         rcrPasswordIndex = 0
+        rcrPasswordsCredentialID = credential.id
         rcrCurrentUsername = credential.username
         if let target = rcrTargetURL {
             rcrCurrentDomain = target.host(percentEncoded: false) ?? credential.domain
@@ -1390,12 +1424,24 @@ class BrowserViewModel {
     }
 
     private func attemptFill() async {
-        guard isRCRRunning, !rcrCurrentPasswords.isEmpty else { return }
+        guard isRCRRunning else { return }
+        await waitIfPaused()
         guard let credential = currentRCRCredential() else {
             rcrIndex += 1
             await runCurrentCredential()
             return
         }
+        // Cross-credential guard: the in-memory password list must belong
+        // to THIS credential. After a park or a burn the list still holds
+        // the previous credential's passwords — rebuild instead of filling
+        // the wrong account's secrets.
+        guard Self.passwordListBelongs(to: credential.id, listCredentialID: rcrPasswordsCredentialID),
+              !rcrCurrentPasswords.isEmpty else {
+            rcrCurrentPasswords = []
+            await runCurrentCredential()
+            return
+        }
+        let generation = rcrAttemptGeneration
         let password = rcrCurrentPasswords[rcrPasswordIndex]
         let targetDomain = rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain
         let siteSetting = fetchSiteSetting(for: targetDomain)
@@ -1441,10 +1487,12 @@ class BrowserViewModel {
         // burning don't fire until these finish. The page is checked after
         // every extra submit — a permanent disable, temp-disable, or success
         // stops further submits immediately instead of continuing to hammer
-        // an account that's already resolved.
+        // an account that's already resolved. The speed dial scales the gap
+        // between submits; the user's configured delay stays the base.
         let extraCount = max(0, UserDefaults.standard.integer(forKey: "rcrExtraSubmits"))
         let rawDelay = UserDefaults.standard.double(forKey: "rcrSubmitDelay")
-        let delay = rawDelay > 0 ? rawDelay : 1.5
+        let baseDelay = rawDelay > 0 ? rawDelay : 1.5
+        let delay = max(0.2, baseDelay * runSpeedProfile.submitGapMultiplier)
         if extraCount > 0 {
             // The extra-submit loop is self-driving (state check after every
             // submit) and can legitimately run for ~50s — the watchdog must
@@ -1452,6 +1500,8 @@ class BrowserViewModel {
             cancelRCRWatchdog()
             rcrExtraSubmitsInFlight = true
             for _ in 0..<extraCount {
+                await waitIfPaused()
+                guard generation == rcrAttemptGeneration else { rcrExtraSubmitsInFlight = false; return }
                 try? await Task.sleep(for: .seconds(delay))
                 guard isRCRRunning else { rcrExtraSubmitsInFlight = false; return }
                 _ = try? await activeTab?.webView?.evaluateJavaScript(submitScript)
@@ -1496,16 +1546,132 @@ class BrowserViewModel {
         armRCRWatchdog()
     }
 
+    // MARK: - Run cockpit (pause / skip / retry / speed)
+
+    /// Sets the live run-speed profile. Applies on the next attempt step
+    /// (fill / submit gap / settle / judge wait) and persists for future
+    /// runs. Watchdogs are rescaled the next time they arm — never shrunk
+    /// below their base, only stretched for slower profiles.
+    func setRunSpeedProfile(_ profile: SpeedProfile) {
+        guard profile != runSpeedProfile else { return }
+        runSpeedProfile = profile
+        SpeedProfile.saved = profile
+        showToast("Speed: \(profile.label)")
+    }
+
+    /// Pauses or resumes the run between attempts. The in-flight attempt
+    /// always completes — pause takes hold before the next fill/submit.
+    func setRCRPaused(_ paused: Bool) {
+        guard isRCRRunning, paused != isRCRPaused else { return }
+        isRCRPaused = paused
+        if paused {
+            // The observation watchdog must not kill an attempt while the
+            // user intentionally rests; it re-arms on resume.
+            cancelRCRWatchdog()
+            showToast("Run paused — resumes between attempts")
+        } else {
+            rcrPauseContinuation?.resume()
+            rcrPauseContinuation = nil
+            if rcrStatus == .waiting || rcrStatus == .navigating {
+                armRCRWatchdog()
+            }
+            showToast("Run resumed")
+        }
+    }
+
+    func toggleRCRPause() {
+        setRCRPaused(!isRCRPaused)
+    }
+
+    /// Suspends the runner while paused. Every async leg of the run passes
+    /// through this gate between attempts.
+    private func waitIfPaused() async {
+        guard isRCRPaused else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            rcrPauseContinuation = continuation
+        }
+    }
+
+    /// Skips the current credential: records it as skipped with a reason,
+    /// and moves the run on to the next credential.
+    func skipCurrentCredential() {
+        guard isRCRRunning, rcrIndex < rcrQueueIDs.count else { return }
+        cancelRCRWatchdog()
+        rcrJudging = false
+        rcrExtraSubmitsInFlight = false
+        rcrAttemptGeneration &+= 1
+        guard let credential = currentRCRCredential() else { return }
+        let password = rcrCurrentPasswords[safe: rcrPasswordIndex] ?? ""
+        if let context = modelContext {
+            _ = AttemptTrackingService.shared.recordAttempt(
+                context: context,
+                credentialID: credential.id,
+                username: credential.username,
+                password: password,
+                passwordIndex: rcrPasswordIndex + 1,
+                passwordTotal: rcrCurrentPasswords.count,
+                targetDomain: rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? credential.domain,
+                sessionTag: "single",
+                status: .skipped,
+                judge: SuccessJudgeEngine.Decision.local(
+                    status: .skipped,
+                    verdict: "skipped",
+                    confidence: 1,
+                    reason: "Skipped by you during the run"
+                )
+            )
+        }
+        showToast("Skipped \(credential.username)")
+        persistRCRProgress(completedID: credential.id)
+        rcrCompletedIDs.insert(credential.id)
+        rcrIndex += 1
+        rcrPasswordIndex = 0
+        rcrCurrentPasswords = []
+        rcrPasswordsCredentialID = ""
+        if rcrIndex >= rcrTotal {
+            rcrStatus = .success
+            UserDefaults.standard.removeObject(forKey: rcrLastCompletedKey)
+            showToast("RCR complete (\(rcrTotal)/\(rcrTotal))")
+            stopRCR()
+            return
+        }
+        Task { await runCurrentCredential() }
+    }
+
+    /// Re-fills and re-submits the password the run just tried — for pages
+    /// that swallowed the first submit.
+    func retryCurrentPassword() {
+        guard isRCRRunning, !rcrCurrentPasswords.isEmpty,
+              rcrPasswordIndex < rcrCurrentPasswords.count else { return }
+        guard !rcrJudging else {
+            showToast("Judging the current attempt — retry in a moment", force: true)
+            return
+        }
+        guard rcrStatus == .waiting || rcrStatus == .submitting else {
+            showToast("Retry is available while watching a submit", force: true)
+            return
+        }
+        cancelRCRWatchdog()
+        rcrJudging = false
+        rcrExtraSubmitsInFlight = false
+        rcrAttemptGeneration &+= 1
+        showToast("Retrying \(rcrCurrentUsername)")
+        Task { await attemptFill() }
+    }
+
     // MARK: - RCR watchdog
 
     /// Arms the per-attempt watchdog. If the page produces no state message
     /// within the timeout (navigation failure, dead page, wedged web
     /// process), the attempt is recorded as failed and the run advances —
-    /// previously the runner sat in "watching" forever.
+    /// previously the runner sat in "watching" forever. The timeout is
+    /// stretched by the speed profile (slower profiles get longer windows)
+    /// and never shrunk below its base.
     private func armRCRWatchdog(timeout: Duration = rcrWatchdogTimeout) {
+        let effective = SpeedProfile.effectiveWatchdog(timeout, profile: runSpeedProfile)
         rcrWatchdogTask?.cancel()
         rcrWatchdogTask = Task { [weak self] in
-            try? await Task.sleep(for: timeout)
+            try? await Task.sleep(for: effective)
             guard let self, !Task.isCancelled else { return }
             self.rcrWatchdogFired()
         }
@@ -1518,6 +1684,8 @@ class BrowserViewModel {
 
     private func rcrWatchdogFired() {
         guard isRCRRunning, rcrStatus == .waiting || rcrStatus == .navigating else { return }
+        // A paused run must never be advanced by its own watchdog.
+        guard !isRCRPaused else { armRCRWatchdog(); return }
         rcrAwaitingNavigation = false
         guard let credential = currentRCRCredential() else {
             rcrIndex += 1
@@ -1643,6 +1811,10 @@ class BrowserViewModel {
     private func judgeAndAdvance(payload: [String: Any], credentialID: String, password: String) async {
         guard isRCRRunning else { return }
         guard let credential = currentRCRCredential(), credential.id == credentialID else { return }
+        // Speed-scaled grace before judging so the page has time to settle
+        // into its final state — slower profiles judge later, never sooner.
+        try? await Task.sleep(for: runSpeedProfile.judgeGrace)
+        guard isRCRRunning else { return }
         let webView = activeTab?.webView
         let image = await WebViewSnapshotter.capture(webView)
         let filename = image.flatMap { ScreenshotStorage.save($0) }
@@ -1772,14 +1944,32 @@ class BrowserViewModel {
     }
 
     /// After a navigation finishes: wait for cookie/consent (and, after a
-    /// burn, extra page-boot + login-form time) then start the fill.
+    /// burn, extra page-boot + login-form time) then start the fill. Also
+    /// applies the site-smart pacing pause: the learned settle time for
+    /// this domain, scaled by the live speed profile, plus a brief
+    /// human-like pre-fill pause.
     private func settleThenFill() async {
         let extra = needsPostBurnSettle
         needsPostBurnSettle = false
+        let settleStart = Date()
         await waitForCookieNoticeIfNeeded(extraBoot: extra)
         guard isRCRRunning else { return }
         if extra, let webView = activeTab?.webView {
             await PageSettleService.waitForLoginForm(in: webView)
+            guard isRCRRunning else { return }
+        }
+        // Learn how long this site really took to settle (bounded EMA),
+        // then rest for the profile-scaled learned time before filling.
+        let domain = rcrTargetURL?.host(percentEncoded: false)?.lowercased() ?? ""
+        if !domain.isEmpty {
+            let observed = Date().timeIntervalSince(settleStart)
+            SitePacingStore.shared.recordSettle(seconds: observed, domain: domain)
+            let learned = SitePacingStore.shared.settleSeconds(for: domain)
+            let scaled = SpeedProfile.scaledSettle(baseSeconds: learned, profile: runSpeedProfile)
+            try? await Task.sleep(for: .seconds(scaled))
+            guard isRCRRunning else { return }
+            let humanPause = SitePacingStore.shared.humanPauseSeconds(for: domain)
+            try? await Task.sleep(for: .seconds(humanPause))
             guard isRCRRunning else { return }
         }
         await attemptFill()

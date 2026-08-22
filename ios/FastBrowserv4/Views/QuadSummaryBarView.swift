@@ -2,7 +2,8 @@ import SwiftUI
 
 /// Compact progress summary shown for the 6-, 8-, 9-, 12-, and 16-window grids instead of
 /// a full stack of per-window cards. Tapping it expands into the detailed
-/// per-window view (see `BrowserView.quadSummarySection`).
+/// per-window view (see `BrowserView.quadSummarySection`). Also hosts the
+/// grid cockpit: pause-all, resume-all, and a per-window freeze menu.
 struct QuadSummaryBarView: View {
     struct LaneSummary: Identifiable {
         let id: Int
@@ -13,6 +14,12 @@ struct QuadSummaryBarView: View {
         let statusColorB: Color
     }
 
+    /// One grid window for the freeze menu.
+    struct FreezeItem: Identifiable {
+        let id: String      // session id, e.g. "S3"
+        let isFrozen: Bool
+    }
+
     let isDual: Bool
     let overallCompleted: Int
     let overallTotal: Int
@@ -20,11 +27,18 @@ struct QuadSummaryBarView: View {
     let anyRunning: Bool
     let lanes: [LaneSummary]
 
+    // MARK: - Grid cockpit
+
+    var isPausedAll: Bool = false
+    var onTogglePauseAll: () -> Void = {}
+    var freezeItems: [FreezeItem] = []
+    var onToggleFreeze: (String) -> Void = { _ in }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Circle()
-                    .fill(anyRunning ? Color.yellow : Color.secondary)
+                    .fill(isPausedAll ? RunStatusStyle.amber : (anyRunning ? Color.yellow : Color.secondary))
                     .frame(width: 8, height: 8)
                 Text(isDual ? "Dual RCR" : "RCR")
                     .font(.caption.weight(.heavy))
@@ -34,10 +48,46 @@ struct QuadSummaryBarView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                 Spacer()
+                if anyRunning || isPausedAll {
+                    Button(action: onTogglePauseAll) {
+                        Image(systemName: isPausedAll ? "play.fill" : "pause.fill")
+                            .font(.caption.bold())
+                            .foregroundStyle(isPausedAll ? AnyShapeStyle(RunStatusStyle.amber) : AnyShapeStyle(.secondary))
+                            .frame(width: 30, height: 26)
+                            .background(Capsule().fill(isPausedAll ? RunStatusStyle.amber.opacity(0.2) : Color.primary.opacity(0.06)))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(isPausedAll ? "Resume all windows" : "Pause all windows")
+                }
+                if !freezeItems.isEmpty {
+                    Menu {
+                        ForEach(freezeItems) { item in
+                            Button {
+                                onToggleFreeze(item.id)
+                            } label: {
+                                Label(
+                                    item.isFrozen ? "\(item.id) · frozen" : "\(item.id) · running",
+                                    systemImage: item.isFrozen ? "play.slash.fill" : "snowflake"
+                                )
+                            }
+                        }
+                    } label: {
+                        Image(systemName: freezeItems.contains(where: { $0.isFrozen }) ? "snowflake" : "snowflake.circle")
+                            .font(.caption.bold())
+                            .foregroundStyle(
+                                freezeItems.contains(where: { $0.isFrozen })
+                                    ? AnyShapeStyle(Color.indigo)
+                                    : AnyShapeStyle(.secondary)
+                            )
+                            .frame(width: 30, height: 26)
+                            .background(Capsule().fill(Color.primary.opacity(0.06)))
+                    }
+                    .accessibilityLabel("Freeze windows")
+                }
                 Text("Expand")
                     .font(.system(size: 9, weight: .heavy))
                     .foregroundStyle(.cyan)
-                Image(systemName: "chevron.up")
+                Image(systemName: "chevron.down")
                     .font(.caption2.bold())
                     .foregroundStyle(.cyan)
             }

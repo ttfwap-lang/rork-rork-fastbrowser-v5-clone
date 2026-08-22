@@ -61,6 +61,17 @@ final class QuadSession: Identifiable {
 
     var rcrPasswords: [String] = []
     var rcrPasswordIndex: Int = 0
+    /// Which credential the in-memory `rcrPasswords` list belongs to.
+    /// Guards against the cross-credential bug where a parked run handed
+    /// the next credential the previous one's password list.
+    var rcrPasswordsCredentialID: String = ""
+    /// Bumped by skip/retry/stop so in-flight fill legs (extra-submit
+    /// loops) can detect they've been superseded and bail out instead of
+    /// racing the new attempt.
+    var rcrAttemptGeneration: Int = 0
+    /// True while this window rests between attempts (freeze control).
+    /// Pause-all is separate and lives on the controller.
+    var isRCRFrozen: Bool = false
     var rcrAwaitingNavigation: Bool = false
     /// Per-attempt watchdog: fires when a navigation or the post-submit
     /// observation produces no page state within the timeout (dead page,

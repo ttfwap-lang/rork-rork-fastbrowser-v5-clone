@@ -163,6 +163,7 @@ struct AIFeaturesTests {
     func attemptOrder_skipsUnavailableCloud() {
         let order = IntelligenceCenter.attemptOrder(
             preferred: .appleCloud,
+            rorkOK: false,
             onDeviceOK: true,
             cloudOK: false,
             keysOK: true
@@ -176,11 +177,24 @@ struct AIFeaturesTests {
     func attemptOrder_preferredCloudFirstWhenReady() {
         let order = IntelligenceCenter.attemptOrder(
             preferred: .appleCloud,
+            rorkOK: false,
             onDeviceOK: true,
             cloudOK: true,
             keysOK: false
         )
         #expect(order == [.appleCloud, .onDevice])
+    }
+
+    @Test
+    func attemptOrder_rorkCloudIsDefaultFallback() {
+        let order = IntelligenceCenter.attemptOrder(
+            preferred: .onDevice,
+            rorkOK: true,
+            onDeviceOK: false,
+            cloudOK: false,
+            keysOK: false
+        )
+        #expect(order == [.rorkCloud])
     }
 
     @Test
