@@ -101,6 +101,13 @@ struct WebViewWrapper: UIViewRepresentable {
                     viewModel?.addHistoryEntry(url: url, title: tab.title, tabID: tab.id)
                 }
 
+                // Restore queued session storage once this tab lands on the
+                // saved origin (Load Session flow).
+                SessionTransferService.shared.applyPendingStorageIfNeeded(
+                    storeID: tab.dataStoreID,
+                    webView: webView
+                )
+
                 WindowDiagnosticsService.shared.pageDidFinish(tab: tab)
 
                 if viewModel?.isRCRRunning == true {

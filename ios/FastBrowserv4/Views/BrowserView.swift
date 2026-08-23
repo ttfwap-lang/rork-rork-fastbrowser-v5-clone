@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UniformTypeIdentifiers
 
 struct BrowserView: View {
     @Environment(\.modelContext) private var modelContext
@@ -92,6 +93,21 @@ struct BrowserView: View {
             Button("Not Now", role: .cancel) {}
         } message: {
             Text("Save credentials for \(viewModel.detectedDomain.isEmpty ? (viewModel.activeTab?.domain ?? "this site") : viewModel.detectedDomain)?\nUsername: \(viewModel.detectedUsername)")
+        }
+        .fileExporter(
+            isPresented: $viewModel.isExportingSession,
+            document: viewModel.sessionExportDocument,
+            contentType: .json,
+            defaultFilename: viewModel.sessionExportDefaultName
+        ) { result in
+            viewModel.finishSessionExport(result)
+        }
+        .fileImporter(
+            isPresented: $viewModel.isImportingSession,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            viewModel.handleSessionImport(result)
         }
     }
 
@@ -798,6 +814,25 @@ struct BrowserView: View {
                     diagnostics.overlayEnabled ? "Hide Diagnostics" : "Show Diagnostics",
                     systemImage: "memorychip"
                 )
+            }
+            Divider()
+            if viewModel.isQuadMode && !viewModel.isDualQuadMode {
+                Button {
+                    viewModel.quadController.toggleFollowLeader()
+                } label: {
+                    Label(
+                        viewModel.quadController.isFollowLeaderEnabled ? "Follow the Leader: On" : "Follow the Leader",
+                        systemImage: viewModel.quadController.isFollowLeaderEnabled ? "checkmark.circle.fill" : "person.2.wave.2"
+                    )
+                }
+            }
+            if !viewModel.isQuadMode {
+                Button("Save Session", systemImage: "square.and.arrow.down") {
+                    viewModel.prepareSessionExport()
+                }
+            }
+            Button("Load Session", systemImage: "square.and.arrow.up") {
+                viewModel.startSessionImport()
             }
             Divider()
             Button("Settings", systemImage: "gear") {

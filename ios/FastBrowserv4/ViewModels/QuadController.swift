@@ -58,6 +58,16 @@ final class QuadController {
     private(set) var dualSiteSplitPattern: DualSiteSplitPattern = .checkerboard
     private(set) var isDualTargetMode: Bool = false
 
+    // MARK: - Follow the Leader
+    /// When on, actions in the first window (the Leader) are mirrored onto
+    /// every other window with a cascading one-second-per-window delay.
+    private(set) var isFollowLeaderEnabled: Bool = false
+    /// Pending staggered replay tasks, cancelled on disable/mode change.
+    private var followLeaderTasks: [Task<Void, Never>] = []
+    /// Bumped on disable so in-flight replays that already passed their
+    /// cancellation check still bail before touching a follower.
+    private var followLeaderGeneration: Int = 0
+
     init() {
         self.sessions = (0..<QuadDataStore.maxSessionCount).map { QuadSession(index: $0) }
     }
@@ -171,6 +181,9 @@ final class QuadController {
     func handleQuadPageLoadAutofill(for session: QuadSession) {
         guard !anyRCRRunning, !session.rcrRunning else { return }
         guard browserViewModel?.isRCRRunning != true else { return }
+        // While following the leader, its typing is mirrored into every
+        // follower — independent per-window autofill would fight that.
+        guard !isFollowLeaderEnabled else { return }
         let autoFillEnabled = UserDefaults.standard.object(forKey: "autoFillOnPageLoad") as? Bool ?? true
         guard autoFillEnabled else { return }
 
@@ -332,6 +345,7 @@ final class QuadController {
     func startQuadRCR(targetURL: URL) {
         guard !anyRCRRunning, !isStartingRCR else { return }
         guard let context = modelContext else { return }
+        autoDisableFollowLeader(reason: "Follow the Leader off — run started")
         dualQuadActive = false
         FillHealerEngine.shared.resetRunBudget()
         ParkedSessionStore.shared.markRunStarted()
@@ -682,6 +696,147 @@ final class QuadController {
             Task { await attemptFillDual(session: s, lane: laneIndex(for: s)) }
         } else {
             Task { await attemptFill(session: s) }
+        }
+    }
+
+    // MARK: - Follow the Leader
+
+    /// True when the mode can be offered: a single-site grid with 2+ live
+    /// windows (never in dual-site split, never in single-window view).
+    var canOfferFollowLeader: Bool {
+        !isDualTargetMode && enabledSessions.count > 1
+    }
+
+    /// The Leader is the first live window. Nil unless the mode is on.
+    var followLeaderIndex: Int? {
+        isFollowLeaderEnabled ? enabledSessions.first?.index : nil
+    }
+
+    private var leaderSession: QuadSession? { enabledSessions.first }
+
+    func toggleFollowLeader() { setFollowLeaderEnabled(!isFollowLeaderEnabled) }
+
+    func setFollowLeaderEnabled(_ on: Bool) {
+        guard on != isFollowLeaderEnabled else { return }
+        if on {
+            guard canOfferFollowLeader else {
+                browserViewModel?.showToast("Follow the Leader needs a single-site grid", force: true)
+                return
+            }
+            guard !anyRCRRunning else {
+                browserViewModel?.showToast("Stop the run before Follow the Leader", force: true)
+                return
+            }
+            isFollowLeaderEnabled = true
+            focusedIndex = leaderSession?.index ?? 0
+            installFollowLeaderRecorder()
+            browserViewModel?.showToast("Follow the Leader on — \(leaderSession?.id ?? "S1") leads")
+        } else {
+            disableFollowLeader(silent: false, reason: "Follow the Leader off")
+        }
+    }
+
+    /// Turns the mode off if it is on. Used when the layout no longer matches
+    /// (grid resized, switched to dual-site or single, or a run started).
+    func autoDisableFollowLeader(reason: String) {
+        guard isFollowLeaderEnabled else { return }
+        disableFollowLeader(silent: false, reason: reason)
+    }
+
+    private func disableFollowLeader(silent: Bool, reason: String?) {
+        guard isFollowLeaderEnabled else { return }
+        isFollowLeaderEnabled = false
+        followLeaderGeneration &+= 1
+        for task in followLeaderTasks { task.cancel() }
+        followLeaderTasks = []
+        leaderSession?.webView?.evaluateJavaScript(
+            JavaScriptInjectionService.followLeaderDisableScript(),
+            completionHandler: nil
+        )
+        if let reason, !silent { browserViewModel?.showToast(reason) }
+    }
+
+    private func installFollowLeaderRecorder() {
+        leaderSession?.webView?.evaluateJavaScript(
+            JavaScriptInjectionService.followLeaderRecorderScript(),
+            completionHandler: nil
+        )
+    }
+
+    /// Re-arms the recorder after the Leader navigates (a fresh page drops
+    /// the previously injected listeners).
+    func followLeaderCellDidFinish(session s: QuadSession) {
+        guard isFollowLeaderEnabled, s.index == leaderSession?.index else { return }
+        s.webView?.evaluateJavaScript(
+            JavaScriptInjectionService.followLeaderRecorderScript(),
+            completionHandler: nil
+        )
+    }
+
+    /// Receives one recorded Leader action and replays it into every
+    /// follower on a cascading `(position + 1) * 1s` delay.
+    func handleFollowLeaderEvent(session s: QuadSession, payload: [String: Any]) {
+        guard isFollowLeaderEnabled, s.index == leaderSession?.index else { return }
+        guard let kind = payload["kind"] as? String,
+              let js = JavaScriptInjectionService.followLeaderReplayScript(kind: kind, payload: payload) else { return }
+        staggerToFollowers { follower in
+            follower.webView?.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    /// Mirrors a shared-URL-bar navigation: the Leader goes now, followers
+    /// fan out on the same cascading delay.
+    func navigateFollowLeader(to url: URL) {
+        guard isFollowLeaderEnabled, let leader = leaderSession else {
+            navigateAll(to: url)
+            return
+        }
+        navigate(leader, to: url)
+        staggerToFollowers { follower in
+            follower.url = url
+            follower.webView?.load(URLRequest(url: url))
+        }
+    }
+
+    func followLeaderGoBack() {
+        leaderSession?.webView?.goBack()
+        staggerToFollowers { $0.webView?.goBack() }
+    }
+
+    func followLeaderGoForward() {
+        leaderSession?.webView?.goForward()
+        staggerToFollowers { $0.webView?.goForward() }
+    }
+
+    func followLeaderReload() {
+        leaderSession?.webView?.reload()
+        staggerToFollowers { $0.webView?.reload() }
+    }
+
+    /// Schedules `action` on each follower window with a cascading delay
+    /// (window 2 → 1s, window 3 → 2s, …), preserving action order via
+    /// monotonic deadlines. Generation + cancellation guards stop any
+    /// pending replay the moment the mode is turned off.
+    private func staggerToFollowers(_ action: @escaping @MainActor (QuadSession) -> Void) {
+        guard isFollowLeaderEnabled, let leader = leaderSession else { return }
+        let followers = enabledSessions.filter { $0.index != leader.index }
+        guard !followers.isEmpty else { return }
+        let now = ContinuousClock.now
+        let generation = followLeaderGeneration
+        for (position, follower) in followers.enumerated() {
+            let deadline = now.advanced(by: .seconds(Double(position + 1)))
+            let task = Task { [weak self, weak follower] in
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                guard let self, !Task.isCancelled,
+                      self.isFollowLeaderEnabled,
+                      self.followLeaderGeneration == generation,
+                      let follower else { return }
+                action(follower)
+            }
+            followLeaderTasks.append(task)
+        }
+        if followLeaderTasks.count > 240 {
+            followLeaderTasks.removeAll { $0.isCancelled }
         }
     }
 
@@ -1477,6 +1632,7 @@ final class QuadController {
     func startDualQuadRCR(urlA: URL, urlB: URL) {
         guard !anyRCRRunning, !isStartingRCR else { return }
         guard let context = modelContext else { return }
+        autoDisableFollowLeader(reason: "Follow the Leader off — run started")
         FillHealerEngine.shared.resetRunBudget()
         ParkedSessionStore.shared.markRunStarted()
         let descriptor = FetchDescriptor<Credential>(

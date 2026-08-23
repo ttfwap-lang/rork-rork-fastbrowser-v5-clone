@@ -174,6 +174,16 @@ class BrowserViewModel {
 
     private var cookiePurgeTask: Task<Void, Never>?
 
+    // MARK: - Session save / load
+    /// Drives the `.fileExporter` for Save Session (single-window only).
+    var isExportingSession: Bool = false
+    /// Drives the `.fileImporter` for Load Session (single or grid).
+    var isImportingSession: Bool = false
+    /// The prepared document handed to the exporter once capture completes.
+    var sessionExportDocument: SessionFileDocument?
+    /// Suggested filename for the exported session.
+    var sessionExportDefaultName: String = "fast6-session"
+
     private var modelContext: ModelContext?
     private var siteSettingCache: [String: SiteSetting?] = [:]
     private var excludedDomainCache: Set<String> = []
@@ -376,6 +386,8 @@ class BrowserViewModel {
                 quadController.navigateTargetSite(to: validURL, targetSiteIndex: 0)
                 // Persist Site A URL so future mode switches use it.
                 UserDefaults.standard.set(validURL.absoluteString, forKey: Self.dualQuadURL_A_Key)
+            } else if quadController.isFollowLeaderEnabled {
+                quadController.navigateFollowLeader(to: validURL)
             } else {
                 quadController.navigateAll(to: validURL)
             }
@@ -448,6 +460,9 @@ class BrowserViewModel {
         }
         isQuadToggling = true
         defer { isQuadToggling = false }
+        // Any layout change invalidates Follow the Leader (grid resize,
+        // dual-site split, or return to single-window view).
+        quadController.autoDisableFollowLeader(reason: "Follow the Leader off — layout changed")
         let wasSingle = (quadMode == .single)
         let wasDual = isDualQuadMode
         let liveSiteA = quadController.representativeSession(forTargetSite: 0)?.webView?.url
@@ -551,6 +566,10 @@ class BrowserViewModel {
 
     func goBack() {
         if isQuadMode {
+            if quadController.isFollowLeaderEnabled {
+                quadController.followLeaderGoBack()
+                return
+            }
             quadController.focusedSession.webView?.goBack()
             return
         }
@@ -559,6 +578,10 @@ class BrowserViewModel {
 
     func goForward() {
         if isQuadMode {
+            if quadController.isFollowLeaderEnabled {
+                quadController.followLeaderGoForward()
+                return
+            }
             quadController.focusedSession.webView?.goForward()
             return
         }
@@ -567,10 +590,100 @@ class BrowserViewModel {
 
     func reload() {
         if isQuadMode {
+            if quadController.isFollowLeaderEnabled {
+                quadController.followLeaderReload()
+                return
+            }
             quadController.focusedSession.webView?.reload()
             return
         }
         activeTab?.webView?.reload()
+    }
+
+    // MARK: - Session save / load
+
+    /// Captures the active tab's cookies + page storage and opens the export
+    /// sheet so the user can save it into Files. Single-window only.
+    func prepareSessionExport() {
+        guard !isQuadMode, let webView = activeTab?.webView else {
+            showToast("Open a page first", force: true)
+            return
+        }
+        Task {
+            let snapshot = await SessionTransferService.shared.capture(from: webView)
+            guard let data = SessionTransferService.encode(snapshot) else {
+                showToast("Couldn't prepare session", force: true)
+                return
+            }
+            sessionExportDocument = SessionFileDocument(data: data)
+            let host = webView.url?.host?.replacingOccurrences(of: "www.", with: "") ?? "session"
+            sessionExportDefaultName = "fast6-\(host)-\(Self.sessionTimestamp())"
+            isExportingSession = true
+        }
+    }
+
+    func finishSessionExport(_ result: Result<URL, Error>) {
+        sessionExportDocument = nil
+        if case .success = result {
+            showToast("Session saved to Files")
+        }
+    }
+
+    func startSessionImport() {
+        isImportingSession = true
+    }
+
+    /// Reads a picked session file and applies it to the open window(s).
+    func handleSessionImport(_ result: Result<[URL], Error>) {
+        guard case .success(let urls) = result, let url = urls.first else { return }
+        guard url.startAccessingSecurityScopedResource() else {
+            showToast("Couldn't open that file", force: true)
+            return
+        }
+        defer { url.stopAccessingSecurityScopedResource() }
+        guard let data = try? Data(contentsOf: url),
+              let snapshot = SessionTransferService.decode(data) else {
+            showToast("Not a valid session file", force: true)
+            return
+        }
+        Task { await applySession(snapshot) }
+    }
+
+    /// Applies a decoded snapshot to the active tab (single) or every live
+    /// window (grid): sets cookies, then reloads onto the saved page so the
+    /// restored session takes effect immediately.
+    private func applySession(_ snapshot: SessionSnapshot) async {
+        let targetURL = URL(string: snapshot.href)
+        if isQuadMode {
+            let windows = quadController.enabledSessions
+            for session in windows {
+                await SessionTransferService.shared.applyCookies(snapshot, toStoreID: session.storeID)
+                if let targetURL {
+                    session.url = targetURL
+                    session.webView?.load(URLRequest(url: targetURL))
+                } else {
+                    session.webView?.reload()
+                }
+            }
+            showToast("Session loaded into \(windows.count) window\(windows.count == 1 ? "" : "s")")
+        } else if let tab = activeTab {
+            await SessionTransferService.shared.applyCookies(snapshot, toStoreID: tab.dataStoreID)
+            if let targetURL {
+                tab.url = targetURL
+                tab.lastURL = targetURL
+                tab.webView?.load(URLRequest(url: targetURL))
+            } else {
+                tab.webView?.reload()
+            }
+            showToast("Session loaded")
+        }
+    }
+
+    nonisolated private static func sessionTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmm"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.string(from: Date())
     }
 
     func updateURLBar() {

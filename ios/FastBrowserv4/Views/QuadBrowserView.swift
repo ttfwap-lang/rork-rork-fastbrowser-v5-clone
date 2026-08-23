@@ -11,6 +11,7 @@ struct QuadCellWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let config = WebViewConfigurationFactory.shared.makeIsolatedConfiguration(dataStoreID: session.storeID)
         config.userContentController.add(context.coordinator, name: "rcrObserver")
+        config.userContentController.add(context.coordinator, name: "followLeader")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -42,6 +43,7 @@ struct QuadCellWebView: UIViewRepresentable {
         }
         webView.addObserver(context.coordinator, forKeyPath: #keyPath(WKWebView.estimatedProgress), options: .new, context: nil)
         webView.configuration.userContentController.add(context.coordinator, name: "rcrObserver")
+        webView.configuration.userContentController.add(context.coordinator, name: "followLeader")
         webView.navigationDelegate = context.coordinator
         context.coordinator.ownedWebView = webView
         session.webView = webView
@@ -107,6 +109,14 @@ struct QuadCellWebView: UIViewRepresentable {
                 }
                 controller?.cellPageDidFinish(session: session)
                 WindowDiagnosticsService.shared.pageDidFinish(session: session)
+                // Re-arm the Follow the Leader recorder on the leader window.
+                controller?.followLeaderCellDidFinish(session: session)
+                // Restore queued session storage once this window lands on
+                // the saved origin (Load Session flow).
+                SessionTransferService.shared.applyPendingStorageIfNeeded(
+                    storeID: session.storeID,
+                    webView: webView
+                )
                 // Page-load autofill for multi-window tiles (skips while any
                 // RCR run is active).
                 if !session.rcrRunning {
@@ -168,20 +178,28 @@ struct QuadCellWebView: UIViewRepresentable {
             _ userContentController: WKUserContentController,
             didReceive message: WKScriptMessage
         ) {
-            guard message.name == "rcrObserver" else { return }
+            let name = message.name
+            guard name == "rcrObserver" || name == "followLeader" else { return }
             let body = message.body as? [String: Any] ?? [:]
             // Capture the sender's origin on this thread — WKScriptMessage
             // isn't safe to pass across actor hops.
             let originHost = message.frameInfo.securityOrigin.host
             Task { @MainActor in
-                // Origin gate: only the run's target host may drive RCR
-                // state — a forged `hasDisabled` post from any other origin
-                // would otherwise trigger vault auto-deletion.
-                guard BrowserViewModel.isTrustedRCROrigin(
-                    originHost,
-                    targetHost: session.rcrTargetURL?.host(percentEncoded: false)
-                ) else { return }
-                controller?.handleRCRMessage(session: session, payload: body)
+                switch name {
+                case "rcrObserver":
+                    // Origin gate: only the run's target host may drive RCR
+                    // state — a forged `hasDisabled` post from any other
+                    // origin would otherwise trigger vault auto-deletion.
+                    guard BrowserViewModel.isTrustedRCROrigin(
+                        originHost,
+                        targetHost: session.rcrTargetURL?.host(percentEncoded: false)
+                    ) else { return }
+                    controller?.handleRCRMessage(session: session, payload: body)
+                case "followLeader":
+                    controller?.handleFollowLeaderEvent(session: session, payload: body)
+                default:
+                    break
+                }
             }
         }
     }
@@ -290,6 +308,20 @@ struct QuadBrowserView: View {
                                 Text(session.targetSiteIndex == 0 ? "A" : "B")
                                     .font(.system(size: 8, weight: .black, design: .rounded))
                                     .foregroundStyle(session.targetSiteIndex == 0 ? .purple : .orange)
+                            }
+                            if controller.isFollowLeaderEnabled {
+                                if controller.followLeaderIndex == session.index {
+                                    Text("LEADER")
+                                        .font(.system(size: 8, weight: .black, design: .rounded))
+                                        .foregroundStyle(.black)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1)
+                                        .background(.cyan, in: .capsule)
+                                } else {
+                                    Image(systemName: "arrow.turn.down.right")
+                                        .font(.system(size: 8, weight: .black))
+                                        .foregroundStyle(.cyan.opacity(0.9))
+                                }
                             }
                             if session.rcrTotal > 0 {
                                 Text("\(min(session.rcrIndex, session.rcrTotal))/\(session.rcrTotal)")
