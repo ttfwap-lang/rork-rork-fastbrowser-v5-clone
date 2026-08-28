@@ -215,53 +215,106 @@ struct QuadBrowserView: View {
 
     var body: some View {
         GeometryReader { geo in
-            let size = controller.gridSize
-            let spacing: CGFloat = 1
-            // Floor each cell size so every tile is identical; leftover
-            // fractional pixels are absorbed by centered gutters so 6- and
-            // 12- and 16-window grids never leave uneven rows/columns.
-            let totalHSpacing = spacing * CGFloat(max(0, size.columns - 1))
-            let totalVSpacing = spacing * CGFloat(max(0, size.rows - 1))
-            let cellW = floor((geo.size.width - totalHSpacing) / CGFloat(size.columns))
-            let cellH = floor((geo.size.height - totalVSpacing) / CGFloat(size.rows)
-            )
-            let usedW = cellW * CGFloat(size.columns) + totalHSpacing
-            let usedH = cellH * CGFloat(size.rows) + totalVSpacing
-            let hPad = max(0, (geo.size.width - usedW) / 2)
-            let vPad = max(0, (geo.size.height - usedH) / 2)
-
-            VStack(spacing: spacing) {
-                ForEach(0..<size.rows, id: \.self) { row in
-                    HStack(spacing: spacing) {
-                        ForEach(0..<size.columns, id: \.self) { column in
-                            let index = row * size.columns + column
-                            if index < controller.activeCount {
-                                cell(controller.sessions[index])
-                                    .frame(width: cellW, height: cellH)
-                                    .clipped()
-                            } else {
-                                Color.black
-                                    .frame(width: cellW, height: cellH)
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
+            ZStack {
+                Color.black
+                // Every active window is rendered in ONE ZStack with an
+                // absolute frame/position so toggling Follow the Leader only
+                // re-lays-out the existing web views (no reload / teardown),
+                // and hidden followers stay mounted and awake.
+                ForEach(controller.activeSessions) { session in
+                    let layout = cellLayout(for: session, in: geo.size)
+                    cell(session)
+                        .frame(width: layout.width, height: layout.height)
+                        .clipped()
+                        .opacity(layout.opacity)
+                        .allowsHitTesting(layout.interactive)
+                        .position(x: layout.centerX, y: layout.centerY)
+                        .zIndex(layout.z)
                 }
             }
-            .padding(.horizontal, hPad)
-            .padding(.vertical, vPad)
-            .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
+            .frame(width: geo.size.width, height: geo.size.height)
             .background(Color.black)
             .overlay(alignment: .top) {
-                if diagnostics.overlayEnabled {
-                    ProcessMemoryStrip(
-                        sample: diagnostics.processSample,
-                        windowCount: controller.enabledSessions.count
-                    )
-                    .padding(.top, 4)
+                VStack(spacing: 4) {
+                    if controller.isFollowLeaderEnabled {
+                        followerStatusStrip
+                    }
+                    if diagnostics.overlayEnabled && !controller.isFollowLeaderEnabled {
+                        ProcessMemoryStrip(
+                            sample: diagnostics.processSample,
+                            windowCount: controller.enabledSessions.count
+                        )
+                    }
                 }
+                .padding(.top, 4)
             }
         }
+    }
+
+    private struct CellLayout {
+        var width: CGFloat
+        var height: CGFloat
+        var centerX: CGFloat
+        var centerY: CGFloat
+        var opacity: Double
+        var interactive: Bool
+        var z: Double
+    }
+
+    /// Absolute frame for a window. Normal grids reproduce the previous
+    /// tiled geometry exactly; Follow the Leader blows the leader up to full
+    /// screen and parks the followers tiny, dimmed, and non-interactive
+    /// behind it — kept mounted so their mirrored automation keeps running.
+    private func cellLayout(for session: QuadSession, in size: CGSize) -> CellLayout {
+        if controller.isFollowLeaderEnabled {
+            if controller.followLeaderIndex == session.index {
+                return CellLayout(
+                    width: size.width, height: size.height,
+                    centerX: size.width / 2, centerY: size.height / 2,
+                    opacity: 1, interactive: true, z: 10
+                )
+            }
+            return CellLayout(
+                width: 180, height: 300,
+                centerX: size.width / 2, centerY: size.height / 2,
+                opacity: 0.02, interactive: false, z: 0
+            )
+        }
+        let grid = controller.gridSize
+        let spacing: CGFloat = 1
+        let totalH = spacing * CGFloat(max(0, grid.columns - 1))
+        let totalV = spacing * CGFloat(max(0, grid.rows - 1))
+        let cellW = floor((size.width - totalH) / CGFloat(grid.columns))
+        let cellH = floor((size.height - totalV) / CGFloat(grid.rows))
+        let usedW = cellW * CGFloat(grid.columns) + totalH
+        let usedH = cellH * CGFloat(grid.rows) + totalV
+        let hPad = max(0, (size.width - usedW) / 2)
+        let vPad = max(0, (size.height - usedH) / 2)
+        let cols = max(1, grid.columns)
+        let row = session.index / cols
+        let col = session.index % cols
+        let x = hPad + CGFloat(col) * (cellW + spacing) + cellW / 2
+        let y = vPad + CGFloat(row) * (cellH + spacing) + cellH / 2
+        return CellLayout(
+            width: cellW, height: cellH,
+            centerX: x, centerY: y,
+            opacity: 1, interactive: true, z: 0
+        )
+    }
+
+    /// Compact strip over the full-screen leader showing each hidden
+    /// follower's live mirror status (working / done / misfiring + count).
+    private var followerStatusStrip: some View {
+        let followers = controller.enabledSessions.filter { $0.index != controller.followLeaderIndex }
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(followers) { follower in
+                    FollowerStatusChip(session: follower)
+                }
+            }
+            .padding(.horizontal, 10)
+        }
+        .frame(height: 30)
     }
 
     private func cell(_ session: QuadSession) -> some View {
@@ -323,6 +376,14 @@ struct QuadBrowserView: View {
                                         .foregroundStyle(.cyan.opacity(0.9))
                                 }
                             }
+                            if controller.isFollowLeaderEnabled && controller.followLeaderIndex == session.index {
+                                let misfires = controller.enabledSessions.reduce(0) { $0 + $1.flMisfireCount }
+                                if misfires > 0 {
+                                    Text("\(misfires) misfire\(misfires == 1 ? "" : "s")")
+                                        .font(.system(size: 8, weight: .heavy, design: .rounded))
+                                        .foregroundStyle(.orange)
+                                }
+                            }
                             if session.rcrTotal > 0 {
                                 Text("\(min(session.rcrIndex, session.rcrTotal))/\(session.rcrTotal)")
                                     .font(.system(size: 9, design: .monospaced))
@@ -368,7 +429,7 @@ struct QuadBrowserView: View {
             }
             .overlay(
                 RoundedRectangle(cornerRadius: 0)
-                    .strokeBorder(isFocused ? Color.cyan : .clear, lineWidth: 2)
+                    .strokeBorder(!controller.isFollowLeaderEnabled && isFocused ? Color.cyan : .clear, lineWidth: 2)
             )
             .contentShape(Rectangle())
             .onTapGesture {
@@ -383,5 +444,47 @@ struct QuadBrowserView: View {
                 controller.focusedIndex = session.index
             }
         )
+    }
+}
+
+/// One follower's live mirror status in the Follow-the-Leader strip.
+private struct FollowerStatusChip: View {
+    let session: QuadSession
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Text(session.id)
+                .font(.system(size: 10, weight: .heavy, design: .rounded))
+                .foregroundStyle(.white)
+            if session.flMisfireCount > 0 {
+                HStack(spacing: 1) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 7))
+                    Text("\(session.flMisfireCount)")
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                }
+                .foregroundStyle(.orange)
+            } else if session.flOKCount > 0 {
+                Text("\(session.flOKCount)")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.green)
+            }
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(.black.opacity(0.6), in: .capsule)
+        .overlay(Capsule().stroke(color.opacity(0.5), lineWidth: 0.5))
+    }
+
+    private var color: Color {
+        switch session.followState {
+        case .idle: return .secondary
+        case .working: return .cyan
+        case .ok: return .green
+        case .misfiring: return .orange
+        }
     }
 }

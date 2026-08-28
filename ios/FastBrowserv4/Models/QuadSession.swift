@@ -2,6 +2,12 @@ import Foundation
 import SwiftUI
 import WebKit
 
+/// Live state of a window acting as a Follow-the-Leader follower, for the
+/// compact status strip shown over the full-screen leader.
+nonisolated enum FollowMirrorState {
+    case idle, working, ok, misfiring
+}
+
 /// One of up to sixteen parallel browser sessions used in multi-window mode
 /// (grids of 4, 6, 8, 9, 12, or 16). Owns its own WKWebView (with an isolated
 /// `WKWebsiteDataStore`) and its own RCR progress so every session can run
@@ -90,6 +96,22 @@ final class QuadSession: Identifiable {
     var memorySnapshot: WindowMemorySnapshot?
     /// Latest automated leak-check result for this window.
     var leakCheck: WindowLeakCheckReport = .idle
+
+    // MARK: - Follow the Leader (this window acting as a follower)
+    /// Count of mirrored actions this follower verified as successful.
+    var flOKCount: Int = 0
+    /// Count of mirrored actions that couldn't be verified after retries.
+    var flMisfireCount: Int = 0
+    /// True while this follower is performing a mirrored action.
+    var flBusy: Bool = false
+
+    /// Derived state used by the follower status strip.
+    var followState: FollowMirrorState {
+        if flBusy { return .working }
+        if flMisfireCount > 0 { return .misfiring }
+        if flOKCount > 0 { return .ok }
+        return .idle
+    }
 
     init(index: Int) {
         self.index = index

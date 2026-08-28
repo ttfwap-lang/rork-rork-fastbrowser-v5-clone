@@ -729,8 +729,14 @@ final class QuadController {
             }
             isFollowLeaderEnabled = true
             focusedIndex = leaderSession?.index ?? 0
+            // Fresh misfire tallies for the status strip each time it starts.
+            for follower in enabledSessions {
+                follower.flOKCount = 0
+                follower.flMisfireCount = 0
+                follower.flBusy = false
+            }
             installFollowLeaderRecorder()
-            browserViewModel?.showToast("Follow the Leader on — \(leaderSession?.id ?? "S1") leads")
+            browserViewModel?.showToast("Follow the Leader on — \(leaderSession?.id ?? "S1") leads full screen")
         } else {
             disableFollowLeader(silent: false, reason: "Follow the Leader off")
         }
@@ -774,14 +780,154 @@ final class QuadController {
     }
 
     /// Receives one recorded Leader action and replays it into every
-    /// follower on a cascading `(position + 1) * 1s` delay.
+    /// follower on a cascading `(position + 1) * 1s` delay. Fills, presses,
+    /// checkboxes, and submits go through the verified multi-fallback engine
+    /// (retry + misfire tracking); scrolls stay best-effort.
     func handleFollowLeaderEvent(session s: QuadSession, payload: [String: Any]) {
         guard isFollowLeaderEnabled, s.index == leaderSession?.index else { return }
-        guard let kind = payload["kind"] as? String,
-              let js = JavaScriptInjectionService.followLeaderReplayScript(kind: kind, payload: payload) else { return }
-        staggerToFollowers { follower in
-            follower.webView?.evaluateJavaScript(js, completionHandler: nil)
+        guard let kind = payload["kind"] as? String else { return }
+        switch kind {
+        case "input", "click", "submit", "check":
+            staggerVerifiedToFollowers(kind: kind, payload: payload)
+        case "scroll":
+            guard let js = JavaScriptInjectionService.followLeaderReplayScript(kind: kind, payload: payload) else { return }
+            staggerToFollowers { follower in
+                follower.webView?.evaluateJavaScript(js, completionHandler: nil)
+            }
+        default:
+            break
         }
+    }
+
+    /// Same cascade as `staggerToFollowers`, but each follower runs the
+    /// verified engine (with auto-retry) and updates its misfire tally.
+    private func staggerVerifiedToFollowers(kind: String, payload: [String: Any]) {
+        guard isFollowLeaderEnabled, let leader = leaderSession else { return }
+        let followers = enabledSessions.filter { $0.index != leader.index }
+        guard !followers.isEmpty else { return }
+        let now = ContinuousClock.now
+        let generation = followLeaderGeneration
+        for (position, follower) in followers.enumerated() {
+            let deadline = now.advanced(by: .seconds(Double(position + 1)))
+            let task = Task { [weak self, weak follower] in
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                guard let self, !Task.isCancelled, let follower else { return }
+                guard self.isFollowLeaderEnabled, self.followLeaderGeneration == generation else { return }
+                await self.performVerified(kind: kind, payload: payload, follower: follower, generation: generation)
+            }
+            followLeaderTasks.append(task)
+        }
+        if followLeaderTasks.count > 240 {
+            followLeaderTasks.removeAll { $0.isCancelled }
+        }
+    }
+
+    /// Runs one mirrored action on a follower, retrying up to three times
+    /// before flagging it as a misfire. All work happens inside the
+    /// follower's own web content process, so the leader stays responsive.
+    private func performVerified(
+        kind: String,
+        payload: [String: Any],
+        follower: QuadSession,
+        generation: Int
+    ) async {
+        follower.flBusy = true
+        defer { follower.flBusy = false }
+        guard let webView = follower.webView else {
+            follower.flMisfireCount += 1
+            return
+        }
+        var success = false
+        for attempt in 0..<3 {
+            guard isFollowLeaderEnabled, followLeaderGeneration == generation else { return }
+            success = await runVerified(kind: kind, payload: payload, webView: webView)
+            if success { break }
+            try? await Task.sleep(for: .milliseconds(250 * (attempt + 1)))
+        }
+        guard followLeaderGeneration == generation else { return }
+        if success {
+            follower.flOKCount += 1
+        } else {
+            follower.flMisfireCount += 1
+        }
+    }
+
+    /// Dispatches one verified action to the follower's page and returns
+    /// whether it confirmed success.
+    private func runVerified(kind: String, payload: [String: Any], webView: WKWebView) async -> Bool {
+        switch kind {
+        case "input":
+            guard let sel = payload["selector"] as? String, !sel.isEmpty else { return false }
+            let value = payload["value"] as? String ?? ""
+            return await callVerified(
+                JavaScriptInjectionService.followLeaderFillBody(),
+                args: ["sel": sel, "value": value],
+                successKey: "ok",
+                webView: webView
+            )
+        case "click":
+            guard let sel = payload["selector"] as? String, !sel.isEmpty else { return false }
+            // Handled once the element is located and pressed through the
+            // fallbacks; a genuinely missing target is the misfire signal.
+            return await callVerified(
+                JavaScriptInjectionService.followLeaderClickBody(),
+                args: ["sel": sel],
+                successKey: "found",
+                webView: webView
+            )
+        case "submit":
+            guard let sel = payload["selector"] as? String, !sel.isEmpty else { return false }
+            return await callVerified(
+                JavaScriptInjectionService.followLeaderSubmitBody(),
+                args: ["sel": sel],
+                successKey: "found",
+                webView: webView
+            )
+        case "check":
+            guard let sel = payload["selector"] as? String, !sel.isEmpty else { return false }
+            let checked = payload["checked"] as? Bool ?? false
+            return await callVerified(
+                JavaScriptInjectionService.followLeaderCheckBody(),
+                args: ["sel": sel, "checked": checked],
+                successKey: "ok",
+                webView: webView
+            )
+        default:
+            return false
+        }
+    }
+
+    /// Awaitable wrapper over `callAsyncJavaScript` (which properly awaits
+    /// the body's promises, unlike `evaluateJavaScript`). Resolves the
+    /// result to a plain `Bool` INSIDE the completion handler so no
+    /// non-Sendable `Any` ever crosses the continuation boundary (Swift 6
+    /// data-race safe). Runs in the page content world so the fallback
+    /// engine can read the live DOM back.
+    private func callVerified(
+        _ body: String,
+        args: [String: Any],
+        successKey: String,
+        webView: WKWebView
+    ) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            webView.callAsyncJavaScript(body, arguments: args, in: nil, in: .page) { result in
+                if case .success(let value) = result {
+                    cont.resume(returning: QuadController.boolField(value, successKey) ?? false)
+                } else {
+                    cont.resume(returning: false)
+                }
+            }
+        }
+    }
+
+    /// Reads a boolean field from a `callAsyncJavaScript` object result,
+    /// tolerating either `[String: Any]` or `[AnyHashable: Any]` bridging.
+    /// `nonisolated static` so it can run inside the async-JS completion
+    /// handler without capturing actor state.
+    private nonisolated static func boolField(_ raw: Any?, _ key: String) -> Bool? {
+        if let dict = raw as? [String: Any] { return dict[key] as? Bool }
+        if let dict = raw as? [AnyHashable: Any] { return dict[key] as? Bool }
+        return nil
     }
 
     /// Mirrors a shared-URL-bar navigation: the Leader goes now, followers
