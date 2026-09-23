@@ -723,7 +723,7 @@ final class QuadController {
                 browserViewModel?.showToast("Follow the Leader needs a single-site grid", force: true)
                 return
             }
-            guard !anyRCRRunning else {
+            guard !anyRCRRunning, !isStartingRCR else {
                 browserViewModel?.showToast("Stop the run before Follow the Leader", force: true)
                 return
             }
@@ -817,8 +817,11 @@ final class QuadController {
             }
             followLeaderTasks.append(task)
         }
+        // Prune finished tasks on every fan-out so the list only ever holds
+        // genuinely pending replays; hard-cap as a final backstop.
+        followLeaderTasks.removeAll { $0.isCancelled }
         if followLeaderTasks.count > 240 {
-            followLeaderTasks.removeAll { $0.isCancelled }
+            followLeaderTasks.removeFirst(followLeaderTasks.count - 240)
         }
     }
 
@@ -981,8 +984,11 @@ final class QuadController {
             }
             followLeaderTasks.append(task)
         }
+        // Prune finished tasks on every fan-out so the list only ever holds
+        // genuinely pending replays; hard-cap as a final backstop.
+        followLeaderTasks.removeAll { $0.isCancelled }
         if followLeaderTasks.count > 240 {
-            followLeaderTasks.removeAll { $0.isCancelled }
+            followLeaderTasks.removeFirst(followLeaderTasks.count - 240)
         }
     }
 

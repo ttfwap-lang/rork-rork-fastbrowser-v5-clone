@@ -55,23 +55,59 @@ extension JavaScriptInjectionService {
                 } catch (e) {}
             };
 
-            document.addEventListener('click', function(e) {
-                var p = cssPath(e.target);
-                if (p) post({ kind: 'click', selector: p });
-            }, true);
-
             // Input is debounced per-field so rapid typing coalesces to the
             // settled value instead of flooding followers with a fill per
             // keystroke (each follower fill verifies + retries).
             var inputTimers = {};
+            var pendingValues = {};
+            // Posts every still-pending debounced fill immediately, preserving
+            // user order: typing must land in followers BEFORE the press or
+            // submit that follows it, or a fast Enter submits the old value.
+            var flushInputs = function() {
+                for (var p in inputTimers) {
+                    clearTimeout(inputTimers[p]);
+                    delete inputTimers[p];
+                    var v = pendingValues[p];
+                    if (v != null) { post({ kind: 'input', selector: p, value: v }); }
+                }
+                pendingValues = {};
+            };
             document.addEventListener('input', function(e) {
                 var t = e.target; if (!t) return;
                 var p = cssPath(t); if (!p) return;
                 if (inputTimers[p]) { clearTimeout(inputTimers[p]); }
                 inputTimers[p] = setTimeout(function() {
                     delete inputTimers[p];
-                    post({ kind: 'input', selector: p, value: (t.value != null ? String(t.value) : '') });
+                    var v = pendingValues[p]; delete pendingValues[p];
+                    if (v != null) post({ kind: 'input', selector: p, value: v });
                 }, 300);
+                pendingValues[p] = (t.value != null ? String(t.value) : '');
+            }, true);
+
+            // Clicks on a <label> forward a synthetic click to the labeled
+            // control; recording both makes followers toggle checkboxes twice
+            // (net no-op). Record only the real control click.
+            var lastClick = { el: null, time: 0 };
+            var looksLikeSubmitter = function(el) {
+                try {
+                    var tag = (el.tagName || '').toLowerCase();
+                    if (tag === 'button') return true;
+                    if (tag === 'input') {
+                        var ty = (el.type || '').toLowerCase();
+                        return ty === 'submit' || ty === 'image';
+                    }
+                } catch (e0) {}
+                return false;
+            };
+            document.addEventListener('click', function(e) {
+                var t = e.target;
+                if (!t) return;
+                try { if (t.tagName === 'LABEL') return; } catch (e1) {}
+                flushInputs();
+                lastClick.el = t;
+                lastClick.time = Date.now();
+                var p = cssPath(t);
+                if (p) post({ kind: 'click', selector: p });
             }, true);
 
             document.addEventListener('change', function(e) {
@@ -79,11 +115,25 @@ extension JavaScriptInjectionService {
                 if (t.type === 'checkbox' || t.type === 'radio') {
                     var p = cssPath(t); if (p) post({ kind: 'check', selector: p, checked: !!t.checked });
                 } else if (t.tagName === 'SELECT') {
+                    flushInputs();
                     var p2 = cssPath(t); if (p2) post({ kind: 'input', selector: p2, value: (t.value != null ? String(t.value) : '') });
                 }
             }, true);
 
             document.addEventListener('submit', function(e) {
+                flushInputs();
+                // One press on a submit button fires both 'click' and
+                // 'submit'; if the submit came from the button just recorded,
+                // drop the duplicate or followers submit the form twice.
+                try {
+                    if (lastClick.el && looksLikeSubmitter(lastClick.el)
+                        && e.target && e.target.contains(lastClick.el)
+                        && (Date.now() - lastClick.time) < 1500) {
+                        lastClick.time = 0;
+                        lastClick.el = null;
+                        return;
+                    }
+                } catch (e2) {}
                 var p = cssPath(e.target);
                 if (p) post({ kind: 'submit', selector: p });
             }, true);
@@ -147,6 +197,7 @@ extension JavaScriptInjectionService {
         if (!el) { return { ok: false, found: false, method: -1 }; }
         function nativeSet(element, val) {
             try {
+                if (element.tagName === 'SELECT') { element.value = val; return; }
                 var proto = (window.HTMLTextAreaElement && element instanceof HTMLTextAreaElement)
                     ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
                 var desc = Object.getOwnPropertyDescriptor(proto, 'value');
@@ -160,6 +211,20 @@ extension JavaScriptInjectionService {
             try { element.dispatchEvent(new Event('keyup', { bubbles: true })); } catch (e) {}
         }
         function ok() { try { return el.value === value; } catch (e) { return false; } }
+
+        // Dropdowns get a dedicated path: the input-prototype value setter
+        // does not apply to <select>, so set value + change directly and
+        // verify the readback instead of falling through the text methods.
+        var isSelect = false;
+        try { isSelect = (el.tagName === 'SELECT'); } catch (e0) {}
+        if (isSelect) {
+            try { el.focus({ preventScroll: true }); } catch (e1) {}
+            try { el.value = value; } catch (e2) {}
+            try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (e3) {}
+            try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (e4) {}
+            await new Promise(function(r){ setTimeout(r, 50); });
+            return { ok: ok(), found: true, method: 10 };
+        }
 
         try { el.focus({ preventScroll: true }); } catch (e) {}
         nativeSet(el, value); fire(el);
